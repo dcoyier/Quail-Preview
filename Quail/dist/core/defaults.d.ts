@@ -1,0 +1,2 @@
+import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
+export declare const DEFAULT_THINKING_LEVEL: ThinkingLevel;

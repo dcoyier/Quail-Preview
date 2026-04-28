@@ -1,0 +1,7 @@
+#!/usr/bin/env sh
+set -eu
+DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if [ ! -f "$DIR/dist/cli.js" ]; then
+  npm --prefix "$DIR" run build >/dev/null
+fi
+exec node "$DIR/dist/cli.js" "$@"
