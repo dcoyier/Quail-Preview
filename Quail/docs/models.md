@@ -1,6 +1,7 @@
-# Custom Models
+# Models
 
-Add custom providers and models (Ollama, vLLM, LM Studio, proxies) via `~/.pi/agent/models.json`.
+Quail includes Ollama as a built-in local provider and supports additional custom providers and models
+(vLLM, LM Studio, proxies) via `~/.quail/agent/models.json`.
 
 ## Table of Contents
 
@@ -16,15 +17,17 @@ Add custom providers and models (Ollama, vLLM, LM Studio, proxies) via `~/.pi/ag
 
 ## Minimal Example
 
-For local models (Ollama, LM Studio, vLLM), only `id` is required per model:
+Ollama is available out of the box through its OpenAI-compatible endpoint at
+`http://127.0.0.1:11434/v1`. Quail reads Ollama's `pi`/`quail` launch configuration
+from `~/.ollama/config.json`, local Ollama model manifests, and falls back to
+`qwen3-coder` so `--provider ollama --model <name>` works without writing a provider block.
+
+To pin or add Ollama models explicitly, only `id` is required:
 
 ```json
 {
   "providers": {
     "ollama": {
-      "baseUrl": "http://localhost:11434/v1",
-      "api": "openai-completions",
-      "apiKey": "ollama",
       "models": [
         { "id": "llama3.1:8b" },
         { "id": "qwen2.5-coder:7b" }
@@ -34,7 +37,8 @@ For local models (Ollama, LM Studio, vLLM), only `id` is required per model:
 }
 ```
 
-The `apiKey` is required but Ollama ignores it, so any value works.
+Quail supplies the Ollama endpoint, API type, and ignored `apiKey` automatically. You can
+still override them when pointing at a remote Ollama-compatible server.
 
 Some OpenAI-compatible servers do not understand the `developer` role used for reasoning-capable models. For those providers, set `compat.supportsDeveloperRole` to `false` so pi sends the system prompt as a `system` message instead. If the server also does not support `reasoning_effort`, set `compat.supportsReasoningEffort` to `false` too.
 

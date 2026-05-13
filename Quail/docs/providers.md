@@ -184,7 +184,11 @@ Or set `GOOGLE_APPLICATION_CREDENTIALS` to a service account key file.
 
 ## Custom Providers
 
-**Via models.json:** Add Ollama, LM Studio, vLLM, or any provider that speaks a supported API (OpenAI Completions, OpenAI Responses, Anthropic Messages, Google Generative AI). See [models.md](models.md).
+**Ollama:** Quail includes Ollama as a built-in provider using Ollama's OpenAI-compatible
+`/v1/chat/completions` endpoint. It reads Ollama launch config and local model manifests,
+with `qwen3-coder` as the default model id.
+
+**Via models.json:** Add LM Studio, vLLM, proxies, or any provider that speaks a supported API (OpenAI Completions, OpenAI Responses, Anthropic Messages, Google Generative AI). You can also use `models.json` to pin or override Ollama models. See [models.md](models.md).
 
 **Via extensions:** For providers that need custom API implementations or OAuth flows, create an extension. See [custom-provider.md](custom-provider.md) and [examples/extensions/custom-provider-gitlab-duo](../examples/extensions/custom-provider-gitlab-duo/).
 

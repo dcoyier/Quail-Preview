@@ -2,10 +2,10 @@
  * Model resolution, scoping, and initial selection
  */
 import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
-import { type Api, type KnownProvider, type Model } from "@mariozechner/pi-ai";
+import { type Api, type Model } from "@mariozechner/pi-ai";
 import type { ModelRegistry } from "./model-registry.js";
 /** Default model IDs for each known provider */
-export declare const defaultModelPerProvider: Record<KnownProvider, string>;
+export declare const defaultModelPerProvider: Record<string, string>;
 export interface ScopedModel {
     model: Model<Api>;
     /** Thinking level if explicitly specified in pattern (e.g., "model:high"), undefined otherwise */

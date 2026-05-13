@@ -77,11 +77,12 @@ export function createQuailQueryToolDefinition(cwd, sessionManager, options = {}
     return {
         name: "quail",
         label: "quail",
-        description: "Execute Quail qualitative-analysis DSL against processed datasets. Use this for dataset metadata, grouping, retrieval, counts, distributions, and evidence lookup. Pass dataset names in datasets and DSL statements in code; do not write $ blocks as assistant text.",
+        description: "Execute Quail qualitative-analysis DSL against processed datasets. Use this for dataset metadata, grouping, retrieval, counts, distributions, and entry lookup. Pass dataset names in datasets and DSL statements in code; do not write $ blocks as assistant text.",
         promptSnippet: "Run Quail qualitative-analysis DSL against processed datasets",
         promptGuidelines: [
             "For questions about activated Quail datasets, call quail instead of writing DSL blocks as plain text.",
             "Pass dataset names through the datasets argument and DSL statements through code; do not include $ wrappers or @ dataset lines.",
+            "Use print() for any values that should be returned in the tool result.",
         ],
         parameters: quailQuerySchema,
         executionMode: "sequential",

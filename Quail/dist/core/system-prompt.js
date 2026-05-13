@@ -28,8 +28,6 @@ export function buildSystemPrompt(options) {
                 prompt += `## ${filePath}\n\n${content}\n\n`;
             }
         }
-        prompt += `\nCurrent date: ${date}`;
-        prompt += `\nCurrent working directory: ${promptCwd}`;
         return prompt;
     }
     if (customPrompt) {
@@ -50,9 +48,11 @@ export function buildSystemPrompt(options) {
         if (customPromptHasRead && skills.length > 0) {
             prompt += formatSkillsForPrompt(skills);
         }
-        // Add date and working directory last
-        prompt += `\nCurrent date: ${date}`;
-        prompt += `\nCurrent working directory: ${promptCwd}`;
+        // Add date and working directory last for the generic coding-agent prompt.
+        if (APP_NAME !== "quail") {
+            prompt += `\nCurrent date: ${date}`;
+            prompt += `\nCurrent working directory: ${promptCwd}`;
+        }
         return prompt;
     }
     // Get absolute paths to documentation and examples

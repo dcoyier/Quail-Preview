@@ -44,7 +44,7 @@ import { InteractiveMode, runPrintMode, runRpcMode } from "./modes/index.js";
 import { ExtensionSelectorComponent } from "./modes/interactive/components/extension-selector.js";
 import { initTheme, stopThemeWatcher } from "./modes/interactive/theme/theme.js";
 import { handleConfigCommand, handlePackageCommand } from "./package-manager-cli.js";
-import { handleDatasetCommand } from "./quail/index.js";
+import { handleDatasetCommand, handleExecutorCommand } from "./quail/index.js";
 import { isLocalPath } from "./utils/paths.js";
 
 /**
@@ -437,6 +437,10 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 
 	if (await handleDatasetCommand(args)) {
+		return;
+	}
+
+	if (await handleExecutorCommand(args)) {
 		return;
 	}
 

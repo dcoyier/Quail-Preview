@@ -1,4 +1,5 @@
 # Quail v0.7 Specification
+(summarized codebase; outdated)
 
 ## Summary
 
@@ -273,4 +274,3 @@ Important integration points:
 ## Definition Of Quail v0.7
 
 Quail v0.7 is best understood as a local, terminal-based qualitative research companion: a Pi-derived agent shell whose default behavior has been narrowed around evidence retrieval and corpus analysis. Its distinctive pieces are local dataset processing, BM25 plus embedding search, a constrained analysis DSL, session-persistent analytic state, dataset activation through `@"Dataset Name"`, and a dedicated `quail` tool that forces the assistant to inspect the corpus before answering.
-

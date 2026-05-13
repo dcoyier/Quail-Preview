@@ -1,4 +1,5 @@
 Quail v0.7
+(initial spec; outdated)
 
 I want this to be a single agent qualitative analysis harness that makes tool calls against a processed corpus to formulate a response. The tool calls should not be strict JSON output, but rather a code mode + API layer.
 

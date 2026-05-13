@@ -1,14 +1,36 @@
 export interface CorpusEntryInput {
     text: string;
+    fields: Record<string, FieldValue>;
     tags: Record<string, string>;
+    textFields?: string[];
+}
+export type FieldValue = string | number | boolean | null | FieldValue[] | {
+    [key: string]: FieldValue;
+};
+export type FieldType = "string" | "int" | "float" | "bool" | "null" | "list" | "object" | "mixed";
+export type FieldTypeOverride = FieldType | "boolean";
+export interface FieldInspection {
+    name: string;
+    type: FieldType;
+    embedded: boolean;
+    nonEmptyCount: number;
+    samples: string[];
+}
+export interface DatasetInspection {
+    entryCount: number;
+    fieldTypes: Record<string, FieldType>;
+    embeddedFields: string[];
+    fields: FieldInspection[];
 }
 export interface QuailEntry {
     id: string;
     dataset: string;
     ordinal: number;
     text: string;
+    fields: Record<string, FieldValue>;
     tags: Record<string, string>;
     contains: string;
+    fieldContains: Record<string, string>;
 }
 export interface Bm25Index {
     k1: number;
@@ -32,6 +54,10 @@ export interface QuailDatasetManifest {
     updatedAt: string;
     entryCount: number;
     metadataFields: string[];
+    fieldNames?: string[];
+    textFields?: string[];
+    fieldTypes?: Record<string, FieldType>;
+    embeddedFields?: string[];
     embeddingModel: string;
     embeddingDimensions: number;
     batchSize: number;
@@ -60,6 +86,7 @@ export interface ProcessDatasetOptions {
     model?: string;
     batchSize?: number;
     globalTags?: Record<string, string>;
+    fieldTypes?: Record<string, FieldTypeOverride>;
     skipEmbeddings?: boolean;
     overwrite?: boolean;
     onProgress?: (message: string) => void;
@@ -72,12 +99,15 @@ export interface DatasetListItem {
     metadataFields: string[];
     createdAt: string;
 }
+export declare function fieldDocumentId(entryId: string, field: string): string;
+export declare function fieldValueToText(value: unknown): string;
 export declare function parseCorpusFile(inputPath: string, options?: {
     format?: string;
     textColumn?: string;
 }): CorpusEntryInput[];
-export declare function buildBm25Index(entries: QuailEntry[]): Bm25Index;
+export declare function buildBm25Index(entries: QuailEntry[], fieldTypes?: Record<string, FieldType>): Bm25Index;
 export declare function bm25Score(index: Bm25Index, entryId: string, query: string): number;
+export declare function bm25ScoreTerms(index: Bm25Index, entryId: string, terms: readonly string[]): number;
 export declare function cosineSimilarity(a: EmbeddingVector, b: EmbeddingVector): number;
 export declare function embedTexts(texts: string[], options?: {
     model?: string;
@@ -89,4 +119,11 @@ export declare function listDatasets(cwd: string): DatasetListItem[];
 export declare function removeDataset(cwd: string, name: string): boolean;
 export declare function loadDataset(cwd: string, name: string): LoadedQuailDataset;
 export declare function loadDatasets(cwd: string, names: string[]): LoadedQuailDataset[];
+export declare function inspectDatasetFile(options: {
+    inputPath: string;
+    format?: string;
+    textColumn?: string;
+    globalTags?: Record<string, string>;
+    fieldTypes?: Record<string, FieldTypeOverride>;
+}): DatasetInspection;
 export declare function processDataset(options: ProcessDatasetOptions): Promise<QuailDatasetManifest>;

@@ -8,6 +8,7 @@ import { join } from "path";
 import { Type } from "typebox";
 import { Compile } from "typebox/compile";
 import { getAgentDir } from "../config.js";
+import { createOllamaModel, getOllamaDefaults, getOllamaProviderRequestConfig, loadOllamaModels, OLLAMA_PROVIDER, } from "./ollama-provider.js";
 import { clearConfigValueCache, resolveConfigValueOrThrow, resolveConfigValueUncached, resolveHeadersOrThrow, } from "./resolve-config-value.js";
 // Schema for OpenRouter routing preferences
 const PercentileCutoffsSchema = Type.Object({
@@ -265,7 +266,9 @@ export class ModelRegistry {
             // Keep built-in models even if custom models failed to load
         }
         const builtInModels = this.loadBuiltInModels(overrides, modelOverrides);
-        let combined = this.mergeCustomModels(builtInModels, customModels);
+        const ollamaModels = this.loadOllamaBuiltInModels(overrides, modelOverrides);
+        this.ensureOllamaRequestConfig();
+        let combined = this.mergeCustomModels([...builtInModels, ...ollamaModels], customModels);
         // Let OAuth providers modify their models (e.g., update baseUrl)
         for (const oauthProvider of this.authStorage.getOAuthProviders()) {
             const cred = this.authStorage.get(oauthProvider.id);
@@ -298,6 +301,25 @@ export class ModelRegistry {
                 }
                 return model;
             });
+        });
+    }
+    loadOllamaBuiltInModels(overrides, modelOverrides) {
+        const providerOverride = overrides.get(OLLAMA_PROVIDER);
+        const perModelOverrides = modelOverrides.get(OLLAMA_PROVIDER);
+        return loadOllamaModels().map((m) => {
+            let model = m;
+            if (providerOverride) {
+                model = {
+                    ...model,
+                    baseUrl: providerOverride.baseUrl ?? model.baseUrl,
+                    compat: mergeCompat(model.compat, providerOverride.compat),
+                };
+            }
+            const modelOverride = perModelOverrides?.get(model.id);
+            if (modelOverride) {
+                model = applyModelOverride(model, modelOverride);
+            }
+            return model;
         });
     }
     /** Merge custom models into built-in list by provider+id (custom wins on conflicts). */
@@ -358,7 +380,7 @@ export class ModelRegistry {
         }
     }
     validateConfig(config) {
-        const builtInProviders = new Set(getProviders());
+        const builtInProviders = this.getBuiltInProviderNames();
         for (const [providerName, providerConfig] of Object.entries(config.providers)) {
             const isBuiltIn = builtInProviders.has(providerName);
             const hasProviderApi = !!providerConfig.api;
@@ -399,7 +421,7 @@ export class ModelRegistry {
     }
     parseModels(config) {
         const models = [];
-        const builtInProviders = new Set(getProviders());
+        const builtInProviders = this.getBuiltInProviderNames();
         // Cache built-in defaults (api, baseUrl) per provider, extracted from first model.
         const builtInDefaultsCache = new Map();
         const getBuiltInDefaults = (providerName) => {
@@ -407,6 +429,11 @@ export class ModelRegistry {
                 return undefined;
             if (builtInDefaultsCache.has(providerName))
                 return builtInDefaultsCache.get(providerName);
+            if (providerName === OLLAMA_PROVIDER) {
+                const defaults = getOllamaDefaults();
+                builtInDefaultsCache.set(providerName, defaults);
+                return defaults;
+            }
             const builtIn = getModels(providerName);
             if (builtIn.length === 0)
                 return undefined;
@@ -420,32 +447,40 @@ export class ModelRegistry {
                 continue; // Override-only, no custom models
             const builtInDefaults = getBuiltInDefaults(providerName);
             for (const modelDef of modelDefs) {
+                const ollamaBase = providerName === OLLAMA_PROVIDER ? createOllamaModel(modelDef.id) : undefined;
                 const api = modelDef.api ?? providerConfig.api ?? builtInDefaults?.api;
                 if (!api)
                     continue;
                 const baseUrl = modelDef.baseUrl ?? providerConfig.baseUrl ?? builtInDefaults?.baseUrl;
                 if (!baseUrl)
                     continue;
-                const compat = mergeCompat(providerConfig.compat, modelDef.compat);
+                let compat = mergeCompat(providerConfig.compat, modelDef.compat);
+                if (ollamaBase?.compat) {
+                    compat = mergeCompat(ollamaBase.compat, compat);
+                }
                 this.storeModelHeaders(providerName, modelDef.id, modelDef.headers);
                 const defaultCost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
                 models.push({
                     id: modelDef.id,
-                    name: modelDef.name ?? modelDef.id,
+                    name: modelDef.name ?? ollamaBase?.name ?? modelDef.id,
                     api: api,
                     provider: providerName,
                     baseUrl,
-                    reasoning: modelDef.reasoning ?? false,
-                    input: (modelDef.input ?? ["text"]),
-                    cost: modelDef.cost ?? defaultCost,
-                    contextWindow: modelDef.contextWindow ?? 128000,
-                    maxTokens: modelDef.maxTokens ?? 16384,
+                    reasoning: modelDef.reasoning ?? ollamaBase?.reasoning ?? false,
+                    input: (modelDef.input ?? ollamaBase?.input ?? ["text"]),
+                    cost: modelDef.cost ?? ollamaBase?.cost ?? defaultCost,
+                    contextWindow: modelDef.contextWindow ?? ollamaBase?.contextWindow ?? 128000,
+                    maxTokens: modelDef.maxTokens ?? ollamaBase?.maxTokens ?? 16384,
                     headers: undefined,
                     compat,
+                    ...(ollamaBase?.thinkingLevels ? { thinkingLevels: ollamaBase.thinkingLevels } : {}),
                 });
             }
         }
         return models;
+    }
+    getBuiltInProviderNames() {
+        return new Set([...getProviders(), OLLAMA_PROVIDER]);
     }
     /**
      * Get all models (built-in + custom).
@@ -485,6 +520,14 @@ export class ModelRegistry {
             apiKey: config.apiKey,
             headers: config.headers,
             authHeader: config.authHeader,
+        });
+    }
+    ensureOllamaRequestConfig() {
+        const current = this.providerRequestConfigs.get(OLLAMA_PROVIDER);
+        const defaults = getOllamaProviderRequestConfig();
+        this.providerRequestConfigs.set(OLLAMA_PROVIDER, {
+            ...current,
+            apiKey: current?.apiKey ?? defaults.apiKey,
         });
     }
     storeModelHeaders(providerName, modelId, headers) {

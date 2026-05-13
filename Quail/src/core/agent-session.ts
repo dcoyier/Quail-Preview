@@ -232,6 +232,10 @@ const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "hi
 /** Thinking levels including xhigh (for supported models) */
 const THINKING_LEVELS_WITH_XHIGH: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
 
+type ModelWithThinkingLevels = Model<any> & {
+	thinkingLevels?: ThinkingLevel[];
+};
+
 // ============================================================================
 // AgentSession Class
 // ============================================================================
@@ -1557,6 +1561,8 @@ export class AgentSession {
 	 */
 	getAvailableThinkingLevels(): ThinkingLevel[] {
 		if (!this.supportsThinking()) return ["off"];
+		const modelThinkingLevels = (this.model as ModelWithThinkingLevels | undefined)?.thinkingLevels;
+		if (modelThinkingLevels && modelThinkingLevels.length > 0) return modelThinkingLevels;
 		return this.supportsXhighThinking() ? THINKING_LEVELS_WITH_XHIGH : THINKING_LEVELS;
 	}
 

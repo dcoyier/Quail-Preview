@@ -39,11 +39,13 @@ export declare class ModelRegistry {
     private loadModels;
     /** Load built-in models and apply provider/model overrides */
     private loadBuiltInModels;
+    private loadOllamaBuiltInModels;
     /** Merge custom models into built-in list by provider+id (custom wins on conflicts). */
     private mergeCustomModels;
     private loadCustomModels;
     private validateConfig;
     private parseModels;
+    private getBuiltInProviderNames;
     /**
      * Get all models (built-in + custom).
      * If models.json had errors, returns only built-in models.
@@ -64,6 +66,7 @@ export declare class ModelRegistry {
     hasConfiguredAuth(model: Model<Api>): boolean;
     private getModelRequestKey;
     private storeProviderRequestConfig;
+    private ensureOllamaRequestConfig;
     private storeModelHeaders;
     /**
      * Get API key and request headers for a model.

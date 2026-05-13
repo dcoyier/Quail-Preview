@@ -12,15 +12,31 @@ describe("ModelRegistry", () => {
 	let tempDir: string;
 	let modelsJsonPath: string;
 	let authStorage: AuthStorage;
+	let originalOllamaConfigPath: string | undefined;
+	let originalOllamaModels: string | undefined;
 
 	beforeEach(() => {
 		tempDir = join(tmpdir(), `pi-test-model-registry-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		mkdirSync(tempDir, { recursive: true });
 		modelsJsonPath = join(tempDir, "models.json");
 		authStorage = AuthStorage.create(join(tempDir, "auth.json"));
+		originalOllamaConfigPath = process.env.QUAIL_OLLAMA_CONFIG_PATH;
+		originalOllamaModels = process.env.OLLAMA_MODELS;
+		process.env.QUAIL_OLLAMA_CONFIG_PATH = join(tempDir, "missing-ollama-config.json");
+		process.env.OLLAMA_MODELS = join(tempDir, "empty-ollama-models");
 	});
 
 	afterEach(() => {
+		if (originalOllamaConfigPath === undefined) {
+			delete process.env.QUAIL_OLLAMA_CONFIG_PATH;
+		} else {
+			process.env.QUAIL_OLLAMA_CONFIG_PATH = originalOllamaConfigPath;
+		}
+		if (originalOllamaModels === undefined) {
+			delete process.env.OLLAMA_MODELS;
+		} else {
+			process.env.OLLAMA_MODELS = originalOllamaModels;
+		}
 		if (tempDir && existsSync(tempDir)) {
 			rmSync(tempDir, { recursive: true });
 		}
@@ -71,6 +87,38 @@ describe("ModelRegistry", () => {
 		writeFileSync(modelsJsonPath, JSON.stringify({ providers }));
 	}
 
+	function writeOllamaManifest(
+		modelName: string,
+		tag: string,
+		config: {
+			capabilities?: string[];
+			context_length?: number;
+			model_family?: string;
+			model_families?: string[];
+			parser?: string;
+			renderer?: string;
+		},
+	) {
+		const modelsRoot = process.env.OLLAMA_MODELS!;
+		const digest = `${modelName.replace(/[^a-z0-9]/gi, "-")}-${tag.replace(/[^a-z0-9]/gi, "-")}`;
+		const manifestDir = join(modelsRoot, "manifests", "registry.ollama.ai", "library", modelName);
+		const blobsDir = join(modelsRoot, "blobs");
+		mkdirSync(manifestDir, { recursive: true });
+		mkdirSync(blobsDir, { recursive: true });
+		writeFileSync(
+			join(manifestDir, tag),
+			JSON.stringify({
+				schemaVersion: 2,
+				config: {
+					mediaType: "application/vnd.docker.container.image.v1+json",
+					digest: `sha256:${digest}`,
+					size: 1,
+				},
+			}),
+		);
+		writeFileSync(join(blobsDir, `sha256-${digest}`), JSON.stringify(config));
+	}
+
 	const openAiModel: Model<Api> = {
 		id: "test-openai-model",
 		name: "Test OpenAI Model",
@@ -87,6 +135,120 @@ describe("ModelRegistry", () => {
 	const emptyContext: Context = {
 		messages: [],
 	};
+
+	describe("built-in Ollama provider", () => {
+		test("loads Ollama as an available OpenAI-compatible provider without user config", async () => {
+			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+			const model = registry.find("ollama", "qwen3-coder");
+
+			expect(model).toBeDefined();
+			expect(model?.api).toBe("openai-completions");
+			expect(model?.baseUrl).toBe("http://127.0.0.1:11434/v1");
+			expect(model?.compat).toMatchObject({
+				supportsDeveloperRole: false,
+				maxTokensField: "max_tokens",
+			});
+			expect(registry.getAvailable().some((m) => m.provider === "ollama")).toBe(true);
+
+			const auth = await registry.getApiKeyAndHeaders(model!);
+			expect(auth).toEqual({ ok: true, apiKey: "ollama", headers: undefined });
+		});
+
+		test("allows Ollama models.json entries to inherit built-in endpoint and auth defaults", () => {
+			writeRawModelsJson({
+				ollama: {
+					models: [{ id: "llama3.2" }],
+				},
+			});
+
+			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+			const model = registry.find("ollama", "llama3.2");
+
+			expect(model).toBeDefined();
+			expect(model?.api).toBe("openai-completions");
+			expect(model?.baseUrl).toBe("http://127.0.0.1:11434/v1");
+			expect(model?.name).toBe("llama3.2");
+		});
+
+		test("uses Ollama manifest capabilities for thinking support and context windows", () => {
+			writeOllamaManifest("deepseek-v4-pro", "cloud", {
+				capabilities: ["completion", "tools", "thinking"],
+				context_length: 1048576,
+			});
+
+			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+			const model = registry.find("ollama", "deepseek-v4-pro:cloud") as
+				| (Model<Api> & { thinkingLevels?: string[] })
+				| undefined;
+
+			expect(model).toBeDefined();
+			expect(model?.reasoning).toBe(true);
+			expect(model?.contextWindow).toBe(1048576);
+			expect(model?.thinkingLevels).toEqual(["off", "low", "medium", "high"]);
+			expect(model?.compat).toMatchObject({
+				supportsReasoningEffort: true,
+				thinkingFormat: "openrouter",
+				reasoningEffortMap: {
+					minimal: "low",
+					low: "low",
+					medium: "medium",
+					high: "high",
+				},
+			});
+		});
+
+		test("uses Ollama GPT-OSS thinking levels without off", () => {
+			writeOllamaManifest("gpt-oss", "120b-cloud", {
+				capabilities: ["completion", "thinking"],
+				model_family: "gptoss",
+			});
+
+			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+			const model = registry.find("ollama", "gpt-oss:120b-cloud") as
+				| (Model<Api> & { thinkingLevels?: string[] })
+				| undefined;
+
+			expect(model?.reasoning).toBe(true);
+			expect(model?.thinkingLevels).toEqual(["low", "medium", "high"]);
+		});
+
+		test("does not mark Ollama models as thinking when capabilities omit thinking", () => {
+			writeOllamaManifest("qwen3-coder", "480b-cloud", {
+				capabilities: ["completion", "tools"],
+				model_family: "qwen3moe",
+			});
+
+			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+			const model = registry.find("ollama", "qwen3-coder:480b-cloud") as
+				| (Model<Api> & { thinkingLevels?: string[] })
+				| undefined;
+
+			expect(model?.reasoning).toBe(false);
+			expect(model?.thinkingLevels).toBeUndefined();
+		});
+
+		test("lets custom Ollama entries inherit installed manifest metadata", () => {
+			writeOllamaManifest("deepseek-v4-pro", "cloud", {
+				capabilities: ["completion", "tools", "thinking"],
+				context_length: 1048576,
+			});
+			writeRawModelsJson({
+				ollama: {
+					models: [{ id: "deepseek-v4-pro:cloud" }],
+				},
+			});
+
+			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+			const model = registry.find("ollama", "deepseek-v4-pro:cloud") as
+				| (Model<Api> & { thinkingLevels?: string[] })
+				| undefined;
+
+			expect(model?.reasoning).toBe(true);
+			expect(model?.contextWindow).toBe(1048576);
+			expect(model?.thinkingLevels).toEqual(["off", "low", "medium", "high"]);
+			expect(model?.compat).toMatchObject({ thinkingFormat: "openrouter" });
+		});
+	});
 
 	describe("baseUrl override (no custom models)", () => {
 		test("overriding baseUrl keeps all built-in models", () => {

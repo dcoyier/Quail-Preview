@@ -27,6 +27,13 @@ import type { TLocalizedValidationError } from "typebox/error";
 import { getAgentDir } from "../config.js";
 import type { AuthStorage } from "./auth-storage.js";
 import {
+	createOllamaModel,
+	getOllamaDefaults,
+	getOllamaProviderRequestConfig,
+	loadOllamaModels,
+	OLLAMA_PROVIDER,
+} from "./ollama-provider.js";
+import {
 	clearConfigValueCache,
 	resolveConfigValueOrThrow,
 	resolveConfigValueUncached,
@@ -375,7 +382,9 @@ export class ModelRegistry {
 		}
 
 		const builtInModels = this.loadBuiltInModels(overrides, modelOverrides);
-		let combined = this.mergeCustomModels(builtInModels, customModels);
+		const ollamaModels = this.loadOllamaBuiltInModels(overrides, modelOverrides);
+		this.ensureOllamaRequestConfig();
+		let combined = this.mergeCustomModels([...builtInModels, ...ollamaModels], customModels);
 
 		// Let OAuth providers modify their models (e.g., update baseUrl)
 		for (const oauthProvider of this.authStorage.getOAuthProviders()) {
@@ -418,6 +427,33 @@ export class ModelRegistry {
 
 				return model;
 			});
+		});
+	}
+
+	private loadOllamaBuiltInModels(
+		overrides: Map<string, ProviderOverride>,
+		modelOverrides: Map<string, Map<string, ModelOverride>>,
+	): Model<Api>[] {
+		const providerOverride = overrides.get(OLLAMA_PROVIDER);
+		const perModelOverrides = modelOverrides.get(OLLAMA_PROVIDER);
+
+		return loadOllamaModels().map((m) => {
+			let model = m;
+
+			if (providerOverride) {
+				model = {
+					...model,
+					baseUrl: providerOverride.baseUrl ?? model.baseUrl,
+					compat: mergeCompat(model.compat, providerOverride.compat),
+				};
+			}
+
+			const modelOverride = perModelOverrides?.get(model.id);
+			if (modelOverride) {
+				model = applyModelOverride(model, modelOverride);
+			}
+
+			return model;
 		});
 	}
 
@@ -491,7 +527,7 @@ export class ModelRegistry {
 	}
 
 	private validateConfig(config: ModelsConfig): void {
-		const builtInProviders = new Set<string>(getProviders());
+		const builtInProviders = this.getBuiltInProviderNames();
 
 		for (const [providerName, providerConfig] of Object.entries(config.providers)) {
 			const isBuiltIn = builtInProviders.has(providerName);
@@ -541,13 +577,18 @@ export class ModelRegistry {
 
 	private parseModels(config: ModelsConfig): Model<Api>[] {
 		const models: Model<Api>[] = [];
-		const builtInProviders = new Set<string>(getProviders());
+		const builtInProviders = this.getBuiltInProviderNames();
 
 		// Cache built-in defaults (api, baseUrl) per provider, extracted from first model.
 		const builtInDefaultsCache = new Map<string, { api: string; baseUrl: string }>();
 		const getBuiltInDefaults = (providerName: string): { api: string; baseUrl: string } | undefined => {
 			if (!builtInProviders.has(providerName)) return undefined;
 			if (builtInDefaultsCache.has(providerName)) return builtInDefaultsCache.get(providerName);
+			if (providerName === OLLAMA_PROVIDER) {
+				const defaults = getOllamaDefaults();
+				builtInDefaultsCache.set(providerName, defaults);
+				return defaults;
+			}
 			const builtIn = getModels(providerName as KnownProvider) as Model<Api>[];
 			if (builtIn.length === 0) return undefined;
 			const defaults = { api: builtIn[0].api, baseUrl: builtIn[0].baseUrl };
@@ -562,34 +603,43 @@ export class ModelRegistry {
 			const builtInDefaults = getBuiltInDefaults(providerName);
 
 			for (const modelDef of modelDefs) {
+				const ollamaBase = providerName === OLLAMA_PROVIDER ? createOllamaModel(modelDef.id) : undefined;
 				const api = modelDef.api ?? providerConfig.api ?? builtInDefaults?.api;
 				if (!api) continue;
 
 				const baseUrl = modelDef.baseUrl ?? providerConfig.baseUrl ?? builtInDefaults?.baseUrl;
 				if (!baseUrl) continue;
 
-				const compat = mergeCompat(providerConfig.compat, modelDef.compat);
+				let compat = mergeCompat(providerConfig.compat, modelDef.compat);
+				if (ollamaBase?.compat) {
+					compat = mergeCompat(ollamaBase.compat, compat);
+				}
 				this.storeModelHeaders(providerName, modelDef.id, modelDef.headers);
 
 				const defaultCost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 				models.push({
 					id: modelDef.id,
-					name: modelDef.name ?? modelDef.id,
+					name: modelDef.name ?? ollamaBase?.name ?? modelDef.id,
 					api: api as Api,
 					provider: providerName,
 					baseUrl,
-					reasoning: modelDef.reasoning ?? false,
-					input: (modelDef.input ?? ["text"]) as ("text" | "image")[],
-					cost: modelDef.cost ?? defaultCost,
-					contextWindow: modelDef.contextWindow ?? 128000,
-					maxTokens: modelDef.maxTokens ?? 16384,
+					reasoning: modelDef.reasoning ?? ollamaBase?.reasoning ?? false,
+					input: (modelDef.input ?? ollamaBase?.input ?? ["text"]) as ("text" | "image")[],
+					cost: modelDef.cost ?? ollamaBase?.cost ?? defaultCost,
+					contextWindow: modelDef.contextWindow ?? ollamaBase?.contextWindow ?? 128000,
+					maxTokens: modelDef.maxTokens ?? ollamaBase?.maxTokens ?? 16384,
 					headers: undefined,
 					compat,
+					...(ollamaBase?.thinkingLevels ? { thinkingLevels: ollamaBase.thinkingLevels } : {}),
 				} as Model<Api>);
 			}
 		}
 
 		return models;
+	}
+
+	private getBuiltInProviderNames(): Set<string> {
+		return new Set([...getProviders(), OLLAMA_PROVIDER]);
 	}
 
 	/**
@@ -645,6 +695,15 @@ export class ModelRegistry {
 			apiKey: config.apiKey,
 			headers: config.headers,
 			authHeader: config.authHeader,
+		});
+	}
+
+	private ensureOllamaRequestConfig(): void {
+		const current = this.providerRequestConfigs.get(OLLAMA_PROVIDER);
+		const defaults = getOllamaProviderRequestConfig();
+		this.providerRequestConfigs.set(OLLAMA_PROVIDER, {
+			...current,
+			apiKey: current?.apiKey ?? defaults.apiKey,
 		});
 	}
 

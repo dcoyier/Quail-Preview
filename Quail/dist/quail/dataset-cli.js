@@ -2,22 +2,25 @@ import { existsSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import chalk from "chalk";
 import { ensureQuailWorkspace, getQuailStagingDir } from "./paths.js";
-import { datasetExists, listDatasets, processDataset, removeDataset } from "./dataset-store.js";
+import { datasetExists, inspectDatasetFile, listDatasets, processDataset, removeDataset } from "./dataset-store.js";
 function printDatasetHelp() {
     console.log(`Quail dataset commands
 
 Usage:
   hatch dataset list
+  hatch dataset inspect --input <file> [--field-type field=type]
   hatch dataset process --name <unique name> --input <file> [--tag field=value]
   hatch dataset process --name <unique name> --text "entry one\nentry two"
   hatch dataset remove <name> --yes
 
 Options:
   --format <auto|txt|csv|tsv|json|jsonl>
-  --text-column <column>
+  --text-column <column>                Legacy preview hint; embedding is type-driven
   --model <ollama embedding model>      Default: embeddinggemma:latest
   --batch-size <n>                      Default: 64
-  --tag <field=value>                   Can be repeated; added to every entry
+  --tag <field=value>                   Can be repeated; added to every entry as a source field
+  --field-type <field=type>             Override inferred type; type is string, int, float, bool, list, object, mixed, or null
+  --dry-run                             Inspect fields without writing a processed dataset
   --overwrite                           Replace an existing dataset of the same name
   --skip-embeddings                     Only for repair/debug workflows
 `);
@@ -29,11 +32,15 @@ function parseKeyValue(value) {
     const key = value.slice(0, index).trim();
     const tagValue = value.slice(index + 1).trim();
     if (!key)
-        throw new Error(`Expected non-empty metadata field in "${value}"`);
+        throw new Error(`Expected non-empty field in "${value}"`);
     return [key, tagValue];
 }
+function parseFieldType(value) {
+    const [key, fieldType] = parseKeyValue(value);
+    return [key, fieldType];
+}
 function parseDatasetArgs(args) {
-    const parsed = { command: args[0], tags: {} };
+    const parsed = { command: args[0], tags: {}, fieldTypes: {} };
     if (parsed.command === "--help" || parsed.command === "-h") {
         parsed.command = "help";
         return parsed;
@@ -80,8 +87,16 @@ function parseDatasetArgs(args) {
             parsed.tags[key] = value;
             i++;
         }
+        else if (arg === "--field-type" && next !== undefined) {
+            const [key, value] = parseFieldType(next);
+            parsed.fieldTypes[key] = value;
+            i++;
+        }
         else if (arg === "--overwrite") {
             parsed.overwrite = true;
+        }
+        else if (arg === "--dry-run") {
+            parsed.dryRun = true;
         }
         else if (arg === "--yes" || arg === "-y") {
             parsed.yes = true;
@@ -103,6 +118,32 @@ function createTextInputFile(cwd, text) {
     const filePath = join(getQuailStagingDir(cwd), `pasted-${Date.now()}.txt`);
     writeFileSync(filePath, text, "utf8");
     return filePath;
+}
+function getInputPath(parsed, cwd) {
+    if (!parsed.input && !parsed.text)
+        throw new Error("--input <file> or --text <text> is required");
+    const inputPath = parsed.text ? createTextInputFile(cwd, parsed.text) : resolve(cwd, parsed.input);
+    if (!existsSync(inputPath))
+        throw new Error(`Input file not found: ${inputPath}`);
+    return inputPath;
+}
+function printInspection(parsed, inputPath) {
+    const inspection = inspectDatasetFile({
+        inputPath,
+        format: parsed.format,
+        textColumn: parsed.textColumn,
+        globalTags: parsed.tags,
+        fieldTypes: parsed.fieldTypes,
+    });
+    console.log(`Detected ${inspection.entryCount} records.`);
+    console.log("");
+    console.log("Fields:");
+    for (const field of inspection.fields) {
+        const samples = field.samples.length > 0 ? `; sample: ${field.samples.join(" | ")}` : "";
+        console.log(`- ${field.name}: ${field.type}; embedded: ${field.embedded ? "yes" : "no"}; non-empty: ${field.nonEmptyCount}${samples}`);
+    }
+    console.log("");
+    console.log(`Embedded fields: ${inspection.embeddedFields.length > 0 ? inspection.embeddedFields.join(", ") : "none"}`);
 }
 export async function handleDatasetCommand(args, cwd = process.cwd()) {
     if (args[0] !== "dataset" && args[0] !== "datasets")
@@ -126,21 +167,26 @@ export async function handleDatasetCommand(args, cwd = process.cwd()) {
                     return true;
                 }
                 for (const item of datasets) {
-                    console.log(`${item.name}\t${item.entryCount} entries\t${item.embeddingModel}\tmetadata: ${item.metadataFields.join(", ") || "none"}`);
+                    console.log(`${item.name}\t${item.entryCount} entries\t${item.embeddingModel}\tfields: ${item.metadataFields.join(", ") || "none"}`);
                 }
                 return true;
             }
+            case "inspect": {
+                const inputPath = getInputPath(parsed, cwd);
+                printInspection(parsed, inputPath);
+                return true;
+            }
             case "process": {
+                const inputPath = getInputPath(parsed, cwd);
+                if (parsed.dryRun) {
+                    printInspection(parsed, inputPath);
+                    return true;
+                }
                 if (!parsed.name)
                     throw new Error("--name is required");
-                if (!parsed.input && !parsed.text)
-                    throw new Error("--input <file> or --text <text> is required");
                 if (!parsed.overwrite && datasetExists(cwd, parsed.name)) {
                     throw new Error(`Dataset "${parsed.name}" already exists. Choose a unique name or pass --overwrite.`);
                 }
-                const inputPath = parsed.text ? createTextInputFile(cwd, parsed.text) : resolve(cwd, parsed.input);
-                if (!existsSync(inputPath))
-                    throw new Error(`Input file not found: ${inputPath}`);
                 const manifest = await processDataset({
                     cwd,
                     inputPath,
@@ -150,11 +196,13 @@ export async function handleDatasetCommand(args, cwd = process.cwd()) {
                     model: parsed.model,
                     batchSize: parsed.batchSize,
                     globalTags: parsed.tags,
+                    fieldTypes: parsed.fieldTypes,
                     overwrite: parsed.overwrite,
                     skipEmbeddings: parsed.skipEmbeddings,
                     onProgress: (message) => console.log(message),
                 });
                 console.log(chalk.green(`Processed dataset "${manifest.name}" with ${manifest.entryCount} entries (${manifest.embeddingModel}, ${manifest.embeddingDimensions} dimensions).`));
+                console.log(`Embedded fields: ${manifest.embeddedFields?.join(", ") || "none"}`);
                 return true;
             }
             case "remove": {

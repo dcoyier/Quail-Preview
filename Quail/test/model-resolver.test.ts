@@ -389,6 +389,10 @@ describe("default model selection", () => {
 		expect(defaultModelPerProvider["vercel-ai-gateway"]).toBe("anthropic/claude-opus-4-6");
 	});
 
+	test("ollama default follows Ollama's Pi integration docs", () => {
+		expect(defaultModelPerProvider.ollama).toBe("qwen3-coder");
+	});
+
 	test("findInitialModel accepts explicit provider custom model ids", async () => {
 		const registry = {
 			getAll: () => allModels,

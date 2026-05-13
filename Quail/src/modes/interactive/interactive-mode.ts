@@ -202,14 +202,15 @@ class QuailDatasetAutocompleteProvider implements AutocompleteProvider {
 	): Promise<{ items: AutocompleteItem[]; prefix: string } | null> {
 		const line = lines[cursorLine] ?? "";
 		const beforeCursor = line.slice(0, cursorCol);
-		const match = beforeCursor.match(/@\"([^\"\n]*)$/) ?? beforeCursor.match(/@([^\\s\"\n]*)$/);
+		const match = beforeCursor.match(/@\"([^\"\n]*)$/) ?? beforeCursor.match(/@([^\s\"\n]*)$/);
 		if (match) {
 			const query = match[1] ?? "";
 			const prefix = match[0];
 			const datasets = listDatasets(this.getCwd()).map((dataset) => ({
-				value: `@\"${dataset.name}\"`,
+				value: prefix.startsWith("@\"") ? `@\"${dataset.name}\"` : `@${dataset.name}`,
 				label: dataset.name,
 				description: `${dataset.entryCount} entries`,
+				insertText: `@\"${dataset.name}\"`,
 			}));
 			const items = query ? fuzzyFilter(datasets, query, (item) => `${item.label} ${item.description ?? ""}`) : datasets;
 			return items.length > 0 ? { items, prefix } : null;
@@ -228,8 +229,9 @@ class QuailDatasetAutocompleteProvider implements AutocompleteProvider {
 			const nextLines = [...lines];
 			const line = nextLines[cursorLine] ?? "";
 			const start = Math.max(0, cursorCol - prefix.length);
-			nextLines[cursorLine] = `${line.slice(0, start)}${item.value}${line.slice(cursorCol)}`;
-			return { lines: nextLines, cursorLine, cursorCol: start + item.value.length };
+			const insertText = "insertText" in item && typeof item.insertText === "string" ? item.insertText : item.value;
+			nextLines[cursorLine] = `${line.slice(0, start)}${insertText}${line.slice(cursorCol)}`;
+			return { lines: nextLines, cursorLine, cursorCol: start + insertText.length };
 		}
 		return this.delegate.applyCompletion(lines, cursorLine, cursorCol, item, prefix);
 	}
@@ -237,7 +239,7 @@ class QuailDatasetAutocompleteProvider implements AutocompleteProvider {
 	shouldTriggerFileCompletion(lines: string[], cursorLine: number, cursorCol: number): boolean {
 		const line = lines[cursorLine] ?? "";
 		const beforeCursor = line.slice(0, cursorCol);
-		if (/@(\"[^\"]*|[^\\s\"]*)$/.test(beforeCursor)) return true;
+		if (/@(\"[^\"]*|[^\s\"]*)$/.test(beforeCursor)) return true;
 		return this.delegate.shouldTriggerFileCompletion?.(lines, cursorLine, cursorCol) ?? false;
 	}
 }

@@ -5,7 +5,9 @@ import {
 	openSync,
 	readdirSync,
 	readFileSync,
+	readSync,
 	rmSync,
+	statSync,
 	writeFileSync,
 	writeSync,
 } from "node:fs";
@@ -15,7 +17,28 @@ import { normalizeContainsText, slugifyDatasetName, stableEntryId, tokenize } fr
 
 export interface CorpusEntryInput {
 	text: string;
+	fields: Record<string, FieldValue>;
 	tags: Record<string, string>;
+	textFields?: string[];
+}
+
+export type FieldValue = string | number | boolean | null | FieldValue[] | { [key: string]: FieldValue };
+export type FieldType = "string" | "int" | "float" | "bool" | "null" | "list" | "object" | "mixed";
+export type FieldTypeOverride = FieldType | "boolean";
+
+export interface FieldInspection {
+	name: string;
+	type: FieldType;
+	embedded: boolean;
+	nonEmptyCount: number;
+	samples: string[];
+}
+
+export interface DatasetInspection {
+	entryCount: number;
+	fieldTypes: Record<string, FieldType>;
+	embeddedFields: string[];
+	fields: FieldInspection[];
 }
 
 export interface QuailEntry {
@@ -23,8 +46,10 @@ export interface QuailEntry {
 	dataset: string;
 	ordinal: number;
 	text: string;
+	fields: Record<string, FieldValue>;
 	tags: Record<string, string>;
 	contains: string;
+	fieldContains: Record<string, string>;
 }
 
 export interface Bm25Index {
@@ -39,6 +64,10 @@ export interface Bm25Index {
 
 export type EmbeddingVector = ArrayLike<number>;
 
+interface DotProductEmbeddingVector extends EmbeddingVector {
+	dotProduct(other: EmbeddingVector): number;
+}
+
 export interface EmbeddingIndex {
 	model: string;
 	dimensions: number;
@@ -52,6 +81,10 @@ export interface QuailDatasetManifest {
 	updatedAt: string;
 	entryCount: number;
 	metadataFields: string[];
+	fieldNames?: string[];
+	textFields?: string[];
+	fieldTypes?: Record<string, FieldType>;
+	embeddedFields?: string[];
 	embeddingModel: string;
 	embeddingDimensions: number;
 	batchSize: number;
@@ -82,6 +115,7 @@ export interface ProcessDatasetOptions {
 	model?: string;
 	batchSize?: number;
 	globalTags?: Record<string, string>;
+	fieldTypes?: Record<string, FieldTypeOverride>;
 	skipEmbeddings?: boolean;
 	overwrite?: boolean;
 	onProgress?: (message: string) => void;
@@ -104,6 +138,20 @@ const MANIFEST_FILE = "manifest.json";
 const ROOT_MANIFEST_FILE = "manifest.json";
 const DEFAULT_EMBEDDING_MODEL = "embeddinggemma:latest";
 const DEFAULT_BATCH_SIZE = 64;
+const MAX_EAGER_VECTOR_FILE_BYTES = 1.5 * 1024 * 1024 * 1024;
+const FIELD_DOC_SEPARATOR = "\u0000";
+const LEGACY_TEXT_FIELD = "text";
+
+interface LoadedDatasetCacheEntry {
+	manifestMtimeMs: number;
+	entriesMtimeMs: number;
+	bm25MtimeMs: number;
+	embeddingsMtimeMs: number;
+	vectorMtimeMs?: number;
+	dataset: LoadedQuailDataset;
+}
+
+const loadedDatasetCache = new Map<string, LoadedDatasetCacheEntry>();
 
 function datasetDir(cwd: string, slug: string): string {
 	return join(getQuailDatasetsDir(cwd), slug);
@@ -115,6 +163,23 @@ function readJson<T>(path: string): T {
 
 function writeJson(path: string, value: unknown): void {
 	writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+}
+
+function getMtimeMs(path: string): number {
+	return statSync(path).mtimeMs;
+}
+
+export function fieldDocumentId(entryId: string, field: string): string {
+	return `${entryId}${FIELD_DOC_SEPARATOR}${field}`;
+}
+
+export function fieldValueToText(value: unknown): string {
+	if (value === undefined || value === null) return "";
+	if (typeof value === "string") return value;
+	if (typeof value === "number" || typeof value === "boolean") return String(value);
+	if (Array.isArray(value)) return value.map(fieldValueToText).filter(Boolean).join(" ");
+	if (typeof value === "object") return JSON.stringify(value);
+	return String(value);
 }
 
 interface BinaryEmbeddingIndexFile {
@@ -130,6 +195,61 @@ function isBinaryEmbeddingIndexFile(value: unknown): value is BinaryEmbeddingInd
 	if (typeof value !== "object" || value === null) return false;
 	const record = value as Record<string, unknown>;
 	return record.format === "float32-binary-v1" && typeof record.model === "string";
+}
+
+function hasDotProduct(vector: EmbeddingVector): vector is DotProductEmbeddingVector {
+	return typeof (vector as Partial<DotProductEmbeddingVector>).dotProduct === "function";
+}
+
+class FileBackedEmbeddingVector implements DotProductEmbeddingVector {
+	readonly length: number;
+	readonly [index: number]: number;
+
+	constructor(
+		private readonly store: FileBackedEmbeddingStore,
+		private readonly index: number,
+		dimensions: number,
+	) {
+		this.length = dimensions;
+	}
+
+	dotProduct(other: EmbeddingVector): number {
+		if (other instanceof FileBackedEmbeddingVector) return this.store.dotProduct(this.index, other.toFloat32Array());
+		return this.store.dotProduct(this.index, other);
+	}
+
+	toFloat32Array(): Float32Array {
+		return this.store.readVector(this.index);
+	}
+}
+
+class FileBackedEmbeddingStore {
+	private readonly scratch: Buffer;
+
+	constructor(
+		private readonly fd: number,
+		private readonly dimensions: number,
+	) {
+		this.scratch = Buffer.allocUnsafe(dimensions * 4);
+	}
+
+	dotProduct(index: number, other: EmbeddingVector): number {
+		readSync(this.fd, this.scratch, 0, this.scratch.byteLength, index * this.dimensions * 4);
+		const n = Math.min(other.length, this.dimensions);
+		let sum = 0;
+		for (let i = 0; i < n; i++) sum += (other[i] ?? 0) * this.scratch.readFloatLE(i * 4);
+		return sum;
+	}
+
+	readVector(index: number): Float32Array {
+		const buffer = Buffer.allocUnsafe(this.dimensions * 4);
+		readSync(this.fd, buffer, 0, buffer.byteLength, index * this.dimensions * 4);
+		return new Float32Array(buffer.buffer, buffer.byteOffset, this.dimensions);
+	}
+
+	vector(index: number): EmbeddingVector {
+		return new FileBackedEmbeddingVector(this, index, this.dimensions);
+	}
 }
 
 function writeEmbeddingIndex(dir: string, fileName: string, index: EmbeddingIndex): void {
@@ -179,9 +299,21 @@ function loadEmbeddingIndex(dir: string, fileName: string): EmbeddingIndex {
 
 	const dimensions = Math.max(0, Math.floor(Number(raw.dimensions) || 0));
 	const ids = Array.isArray(raw.ids) ? raw.ids.map(String) : [];
-	const data = readFileSync(join(dir, raw.vectorsFile || EMBEDDINGS_VECTOR_FILE));
+	const vectorPath = join(dir, raw.vectorsFile || EMBEDDINGS_VECTOR_FILE);
+	const vectorSize = statSync(vectorPath).size;
 	const vectors: Record<string, EmbeddingVector> = {};
 	const bytesPerVector = dimensions * 4;
+	if (dimensions > 0 && vectorSize > MAX_EAGER_VECTOR_FILE_BYTES) {
+		const fd = openSync(vectorPath, "r");
+		const store = new FileBackedEmbeddingStore(fd, dimensions);
+		for (let i = 0; i < ids.length; i++) {
+			const byteOffset = i * bytesPerVector;
+			vectors[ids[i]] = byteOffset + bytesPerVector <= vectorSize ? store.vector(i) : [];
+		}
+		return { model: raw.model, dimensions, vectors };
+	}
+
+	const data = readFileSync(vectorPath);
 	const littleEndian = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
 
 	for (let i = 0; i < ids.length; i++) {
@@ -229,29 +361,250 @@ function splitDelimitedLine(line: string, delimiter: string): string[] {
 	return out.map((cell) => cell.trim());
 }
 
-function parseDelimited(content: string, delimiter: string, textColumn?: string): CorpusEntryInput[] {
-	const lines = content.replace(/^\uFEFF/, "").split(/\r?\n/).filter((line) => line.trim().length > 0);
-	if (lines.length === 0) return [];
-	const headers = splitDelimitedLine(lines[0], delimiter).map((h) => h.trim());
-	const lowerHeaders = headers.map((h) => h.toLowerCase());
-	const requested = textColumn ? lowerHeaders.indexOf(textColumn.toLowerCase()) : -1;
-	const preferredNames = ["text", "response", "content", "answer", "comment", "body"];
-	let textIndex = requested;
-	if (textIndex < 0) {
-		textIndex = preferredNames.map((name) => lowerHeaders.indexOf(name)).find((index) => index >= 0) ?? -1;
-	}
-	if (textIndex < 0) textIndex = 0;
-	return lines.slice(1).flatMap((line) => {
-		const cells = splitDelimitedLine(line, delimiter);
-		const text = (cells[textIndex] ?? "").trim();
-		if (!text) return [];
-		const tags: Record<string, string> = {};
-		for (let i = 0; i < headers.length; i++) {
-			if (i === textIndex) continue;
-			const value = (cells[i] ?? "").trim();
-			if (value) tags[headers[i]] = value;
+function splitDelimitedRecords(content: string, delimiter: string): string[][] {
+	const rows: string[][] = [];
+	let row: string[] = [];
+	let current = "";
+	let quoted = false;
+	const input = content.replace(/^\uFEFF/, "");
+	for (let i = 0; i < input.length; i++) {
+		const ch = input[i];
+		if (ch === '"') {
+			if (quoted && input[i + 1] === '"') {
+				current += '"';
+				i++;
+			} else {
+				quoted = !quoted;
+			}
+			continue;
 		}
-		return [{ text, tags }];
+		if (!quoted && ch === delimiter) {
+			row.push(current.trim());
+			current = "";
+			continue;
+		}
+		if (!quoted && (ch === "\n" || ch === "\r")) {
+			row.push(current.trim());
+			current = "";
+			if (row.some((cell) => cell.length > 0)) rows.push(row);
+			row = [];
+			if (ch === "\r" && input[i + 1] === "\n") i++;
+			continue;
+		}
+		current += ch;
+	}
+	row.push(current.trim());
+	if (row.some((cell) => cell.length > 0)) rows.push(row);
+	return rows;
+}
+
+function inferFieldValue(value: string): FieldValue {
+	const trimmed = value.trim();
+	if (!trimmed) return "";
+	if (/^(true|false)$/i.test(trimmed)) return trimmed.toLowerCase() === "true";
+	if (/^-?\d+$/.test(trimmed)) {
+		const parsed = Number(trimmed);
+		if (Number.isSafeInteger(parsed)) return parsed;
+	}
+	if (/^-?(?:\d+\.\d+|\d+\.|\.\d+)(?:e[+-]?\d+)?$/i.test(trimmed) || /^-?\d+e[+-]?\d+$/i.test(trimmed)) {
+		const parsed = Number(trimmed);
+		if (Number.isFinite(parsed)) return parsed;
+	}
+	return value.trim();
+}
+
+function normalizeFieldType(type: FieldTypeOverride): FieldType {
+	const normalized = String(type).trim().toLowerCase();
+	if (normalized === "boolean") return "bool";
+	if (
+		normalized === "string" ||
+		normalized === "int" ||
+		normalized === "float" ||
+		normalized === "bool" ||
+		normalized === "null" ||
+		normalized === "list" ||
+		normalized === "object" ||
+		normalized === "mixed"
+	) {
+		return normalized;
+	}
+	throw new Error(`Unknown field type "${type}". Expected string, int, float, bool, null, list, object, or mixed.`);
+}
+
+function inferStringType(value: string): FieldType {
+	const trimmed = value.trim();
+	if (!trimmed) return "null";
+	if (/^(true|false)$/i.test(trimmed)) return "bool";
+	if (/^-?(?:0|[1-9]\d*)$/.test(trimmed)) return "int";
+	if (/^-?(?:\d+\.\d+|\d+\.|\.\d+)(?:e[+-]?\d+)?$/i.test(trimmed) || /^-?(?:0|[1-9]\d*)e[+-]?\d+$/i.test(trimmed)) return "float";
+	return "string";
+}
+
+function inferValueType(value: FieldValue): FieldType {
+	if (value === null) return "null";
+	if (typeof value === "string") return inferStringType(value);
+	if (typeof value === "boolean") return "bool";
+	if (typeof value === "number") return Number.isInteger(value) ? "int" : "float";
+	if (Array.isArray(value)) return "list";
+	if (typeof value === "object") return "object";
+	return "string";
+}
+
+function combineFieldTypes(types: Iterable<FieldType>): FieldType {
+	const observed = [...new Set([...types].filter((type) => type !== "null"))];
+	if (observed.length === 0) return "null";
+	if (observed.length === 1) return observed[0];
+	if (observed.includes("mixed")) return "mixed";
+	if (observed.every((type) => type === "int" || type === "float")) return "float";
+	if (observed.includes("string") && observed.every((type) => type === "string" || type === "int" || type === "float" || type === "bool")) return "string";
+	return "mixed";
+}
+
+function inferFieldTypes(
+	entries: readonly CorpusEntryInput[],
+	overrides?: Record<string, FieldTypeOverride>,
+): Record<string, FieldType> {
+	const observed = new Map<string, FieldType[]>();
+	for (const entry of entries) {
+		for (const [field, value] of Object.entries(entry.fields)) {
+			const types = observed.get(field) ?? [];
+			types.push(inferValueType(value));
+			observed.set(field, types);
+		}
+	}
+	const fields = [...observed.keys()].sort();
+	const normalizedOverrides = Object.fromEntries(Object.entries(overrides ?? {}).map(([field, type]) => [field, normalizeFieldType(type)]));
+	const fieldTypes: Record<string, FieldType> = {};
+	for (const field of fields) fieldTypes[field] = normalizedOverrides[field] ?? combineFieldTypes(observed.get(field) ?? []);
+	for (const field of Object.keys(normalizedOverrides)) {
+		if (!(field in fieldTypes)) fieldTypes[field] = normalizedOverrides[field];
+	}
+	return fieldTypes;
+}
+
+function coerceFieldValue(field: string, value: FieldValue, type: FieldType): FieldValue {
+	if (value === null) return null;
+	if (type === "mixed") return value;
+	if (type === "string") return typeof value === "string" ? value.trim() : fieldValueToText(value);
+	if (type === "list") {
+		if (Array.isArray(value)) return value;
+		throw new Error(`Field "${field}" was set to list, but value ${JSON.stringify(value)} is not a list.`);
+	}
+	if (type === "object") {
+		if (typeof value === "object" && !Array.isArray(value)) return value;
+		throw new Error(`Field "${field}" was set to object, but value ${JSON.stringify(value)} is not an object.`);
+	}
+	if (type === "bool") {
+		if (typeof value === "boolean") return value;
+		if (typeof value === "string" && /^(true|false)$/i.test(value.trim())) return value.trim().toLowerCase() === "true";
+		throw new Error(`Field "${field}" was set to bool, but value ${JSON.stringify(value)} cannot be converted to bool.`);
+	}
+	const numericValue = typeof value === "number" ? value : typeof value === "string" && value.trim() ? Number(value.trim()) : Number.NaN;
+	if (!Number.isFinite(numericValue)) {
+		throw new Error(`Field "${field}" was set to ${type}, but value ${JSON.stringify(value)} cannot be converted to ${type}.`);
+	}
+	if (type === "int") {
+		if (!Number.isSafeInteger(numericValue)) throw new Error(`Field "${field}" was set to int, but value ${JSON.stringify(value)} is not a safe integer.`);
+		return numericValue;
+	}
+	if (type === "float") return numericValue;
+	return null;
+}
+
+function coerceFields(fields: Record<string, FieldValue>, fieldTypes: Record<string, FieldType>): Record<string, FieldValue> {
+	return Object.fromEntries(
+		Object.entries(fields).map(([field, value]) => [field, coerceFieldValue(field, value, fieldTypes[field] ?? inferValueType(value))]),
+	);
+}
+
+function getStringFieldNames(fieldTypes: Record<string, FieldType>): string[] {
+	return Object.entries(fieldTypes)
+		.filter(([, type]) => type === "string")
+		.map(([field]) => field)
+		.sort();
+}
+
+function withGlobalFields(entries: readonly CorpusEntryInput[], globalFields: Record<string, string>): CorpusEntryInput[] {
+	return entries.map((entry) => ({
+		...entry,
+		fields: {
+			...entry.fields,
+			...globalFields,
+		},
+	}));
+}
+
+function sampleFieldValues(entries: readonly CorpusEntryInput[], field: string, type: FieldType): string[] {
+	const samples: string[] = [];
+	const seen = new Set<string>();
+	for (const entry of entries) {
+		if (!Object.prototype.hasOwnProperty.call(entry.fields, field)) continue;
+		const value = coerceFieldValue(field, entry.fields[field], type);
+		const text = fieldValueToText(value).trim();
+		if (!text || seen.has(text)) continue;
+		seen.add(text);
+		samples.push(text.slice(0, 160));
+		if (samples.length >= 3) break;
+	}
+	return samples;
+}
+
+function inspectParsedCorpus(
+	entries: readonly CorpusEntryInput[],
+	options?: { globalFields?: Record<string, string>; fieldTypes?: Record<string, FieldTypeOverride> },
+): DatasetInspection {
+	const prepared = withGlobalFields(entries, options?.globalFields ?? {});
+	const fieldTypes = inferFieldTypes(prepared, options?.fieldTypes);
+	const embeddedFields = getStringFieldNames(fieldTypes);
+	const fields = Object.keys(fieldTypes).sort().map((field) => {
+		const type = fieldTypes[field];
+		return {
+			name: field,
+			type,
+			embedded: type === "string",
+			nonEmptyCount: prepared.filter((entry) => fieldValueToText(entry.fields[field]).trim().length > 0).length,
+			samples: sampleFieldValues(prepared, field, type),
+		};
+	});
+	return { entryCount: prepared.length, fieldTypes, embeddedFields, fields };
+}
+
+function getPreferredTextField(headers: string[], textColumn?: string): string | undefined {
+	const lowerHeaders = headers.map((h) => h.toLowerCase());
+	if (textColumn) {
+		const index = lowerHeaders.indexOf(textColumn.toLowerCase());
+		return index >= 0 ? headers[index] : undefined;
+	}
+	const preferredNames = ["text", "response", "content", "answer", "comment", "body"];
+	const index = preferredNames.map((name) => lowerHeaders.indexOf(name)).find((candidate) => candidate >= 0) ?? -1;
+	return index >= 0 ? headers[index] : undefined;
+}
+
+function inferTextFields(fields: Record<string, FieldValue>, preferred?: string): string[] {
+	if (preferred && fieldValueToText(fields[preferred]).trim()) return [preferred];
+	return Object.entries(fields)
+		.filter(([, value]) => typeof value === "string" && value.trim().length > 0)
+		.map(([field]) => field);
+}
+
+function buildDefaultText(fields: Record<string, FieldValue>, textFields: string[]): string {
+	return textFields.map((field) => fieldValueToText(fields[field]).trim()).filter(Boolean).join("\n\n");
+}
+
+function parseDelimited(content: string, delimiter: string, textColumn?: string): CorpusEntryInput[] {
+	const rows = splitDelimitedRecords(content, delimiter);
+	if (rows.length === 0) return [];
+	const headers = rows[0].map((h) => h.trim());
+	const preferredTextField = getPreferredTextField(headers, textColumn);
+	return rows.slice(1).flatMap((cells) => {
+		const fields: Record<string, FieldValue> = {};
+		for (let i = 0; i < headers.length; i++) {
+			const value = (cells[i] ?? "").trim();
+			if (value) fields[headers[i]] = value;
+		}
+		if (Object.keys(fields).length === 0) return [];
+		const textFields = inferTextFields(fields, preferredTextField);
+		return [{ text: buildDefaultText(fields, textFields), fields, tags: {}, textFields }];
 	});
 }
 
@@ -270,43 +623,55 @@ function parseJsonCorpus(content: string, textColumn?: string): CorpusEntryInput
 	const preferred = [textColumn, "text", "response", "content", "answer", "comment", "body"].filter(
 		(value): value is string => typeof value === "string" && value.length > 0,
 	);
-	const addTag = (tags: Record<string, string>, key: string, value: unknown, fallbackPrefix?: string): void => {
+	const toFieldValue = (value: unknown): FieldValue | undefined => {
 		if (value === undefined || value === null) return;
-		if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
-			const tagKey = tags[key] === undefined ? key : fallbackPrefix ? `${fallbackPrefix}.${key}` : key;
-			tags[tagKey] = String(value);
+		if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return value;
+		if (Array.isArray(value)) return value.flatMap((item) => {
+			const converted = toFieldValue(item);
+			return converted === undefined ? [] : [converted];
+		});
+		if (typeof value === "object") {
+			const out: Record<string, FieldValue> = {};
+			for (const [key, nestedValue] of Object.entries(value)) {
+				const converted = toFieldValue(nestedValue);
+				if (converted !== undefined) out[key] = converted;
+			}
+			return out;
 		}
+		return String(value);
 	};
-	const addTagsFromValue = (
-		tags: Record<string, string>,
+	const addFieldFromValue = (
+		fields: Record<string, FieldValue>,
 		key: string,
 		value: unknown,
 		options?: { flatten?: boolean },
 	): void => {
 		if (typeof value === "object" && value !== null && !Array.isArray(value)) {
 			for (const [nestedKey, nestedValue] of Object.entries(value)) {
-				addTag(tags, options?.flatten ? nestedKey : `${key}.${nestedKey}`, nestedValue, key);
+				const converted = toFieldValue(nestedValue);
+				if (converted !== undefined) fields[options?.flatten ? nestedKey : `${key}.${nestedKey}`] = converted;
 			}
 			return;
 		}
-		addTag(tags, key, value);
+		const converted = toFieldValue(value);
+		if (converted !== undefined) fields[key] = converted;
 	};
 	return array.flatMap((item) => {
 		if (typeof item === "string") {
 			const text = item.trim();
-			return text ? [{ text, tags: {} }] : [];
+			return text ? [{ text, fields: { [LEGACY_TEXT_FIELD]: text }, tags: {}, textFields: [LEGACY_TEXT_FIELD] }] : [];
 		}
 		if (typeof item !== "object" || item === null) return [];
 		const record = item as Record<string, unknown>;
 		const textKey = preferred.find((key) => typeof record[key] === "string" && String(record[key]).trim());
-		if (!textKey) return [];
-		const text = String(record[textKey]).trim();
-		const tags: Record<string, string> = {};
+		const fields: Record<string, FieldValue> = {};
 		for (const [key, value] of Object.entries(record)) {
-			if (key === textKey || value === undefined || value === null) continue;
-			addTagsFromValue(tags, key, value, { flatten: key === "metadata" || key === "tags" });
+			if (value === undefined || value === null) continue;
+			addFieldFromValue(fields, key, value, { flatten: key === "metadata" });
 		}
-		return [{ text, tags }];
+		if (Object.keys(fields).length === 0) return [];
+		const textFields = inferTextFields(fields, textKey);
+		return [{ text: buildDefaultText(fields, textFields), fields, tags: {}, textFields }];
 	});
 }
 
@@ -323,7 +688,7 @@ function parseTextCorpus(content: string): CorpusEntryInput[] {
 	if (!normalized) return [];
 	const paragraphEntries = normalized.split(/\n\s*\n+/).map((part) => part.trim()).filter(Boolean);
 	const entries = paragraphEntries.length > 1 ? paragraphEntries : normalized.split(/\n+/).map((part) => part.trim()).filter(Boolean);
-	return entries.map((text) => ({ text, tags: {} }));
+	return entries.map((text) => ({ text, fields: { [LEGACY_TEXT_FIELD]: text }, tags: {}, textFields: [LEGACY_TEXT_FIELD] }));
 }
 
 export function parseCorpusFile(inputPath: string, options?: { format?: string; textColumn?: string }): CorpusEntryInput[] {
@@ -337,35 +702,64 @@ export function parseCorpusFile(inputPath: string, options?: { format?: string; 
 	return parseTextCorpus(content);
 }
 
-export function buildBm25Index(entries: QuailEntry[]): Bm25Index {
+export function buildBm25Index(entries: QuailEntry[], fieldTypes?: Record<string, FieldType>): Bm25Index {
 	const k1 = 1.5;
 	const b = 0.75;
 	const docLengths: Record<string, number> = {};
 	const docFreq: Record<string, number> = {};
 	const termFreq: Record<string, Record<string, number>> = {};
 	let totalLength = 0;
-	for (const entry of entries) {
-		const tokens = tokenize(entry.text);
-		docLengths[entry.id] = tokens.length;
+	for (const [docId, text] of getBm25Documents(entries, fieldTypes)) {
+		const tokens = tokenize(text);
+		docLengths[docId] = tokens.length;
 		totalLength += tokens.length;
 		const tf: Record<string, number> = {};
 		for (const token of tokens) tf[token] = (tf[token] ?? 0) + 1;
-		termFreq[entry.id] = tf;
+		termFreq[docId] = tf;
 		for (const token of new Set(tokens)) docFreq[token] = (docFreq[token] ?? 0) + 1;
 	}
+	const docCount = Object.keys(docLengths).length;
 	return {
 		k1,
 		b,
-		avgDocLength: entries.length > 0 ? totalLength / entries.length : 0,
-		docCount: entries.length,
+		avgDocLength: docCount > 0 ? totalLength / docCount : 0,
+		docCount,
 		docLengths,
 		docFreq,
 		termFreq,
 	};
 }
 
+function getBm25Documents(entries: QuailEntry[], fieldTypes?: Record<string, FieldType>): Array<[string, string]> {
+	return entries.flatMap((entry) => [
+		[entry.id, entry.text] as [string, string],
+		...getStringFieldDocuments([entry], fieldTypes),
+	]);
+}
+
+function getStringFieldDocuments(entries: QuailEntry[], fieldTypes?: Record<string, FieldType>): Array<[string, string]> {
+	const stringFields = fieldTypes ? new Set(getStringFieldNames(fieldTypes)) : undefined;
+	return entries.flatMap((entry) => {
+		const docs: Array<[string, string]> = [];
+		for (const [field, value] of Object.entries(entry.fields)) {
+			if (stringFields && !stringFields.has(field)) continue;
+			if (!stringFields && typeof value !== "string") continue;
+			const text = typeof value === "string" ? value : fieldValueToText(value);
+			if (text.trim()) docs.push([fieldDocumentId(entry.id, field), text]);
+		}
+		return docs;
+	});
+}
+
+function getEmbeddingDocuments(entries: QuailEntry[], fieldTypes?: Record<string, FieldType>): Array<[string, string]> {
+	return getStringFieldDocuments(entries, fieldTypes).filter(([, text]) => text.trim().length > 0);
+}
+
 export function bm25Score(index: Bm25Index, entryId: string, query: string): number {
-	const terms = tokenize(query);
+	return bm25ScoreTerms(index, entryId, tokenize(query));
+}
+
+export function bm25ScoreTerms(index: Bm25Index, entryId: string, terms: readonly string[]): number {
 	if (terms.length === 0 || index.docCount === 0) return 0;
 	const tf = index.termFreq[entryId] ?? {};
 	const dl = index.docLengths[entryId] ?? 0;
@@ -389,6 +783,8 @@ function l2Normalize(vector: number[]): number[] {
 }
 
 export function cosineSimilarity(a: EmbeddingVector, b: EmbeddingVector): number {
+	if (hasDotProduct(b)) return b.dotProduct(a);
+	if (hasDotProduct(a)) return a.dotProduct(b);
 	const n = Math.min(a.length, b.length);
 	let sum = 0;
 	for (let i = 0; i < n; i++) sum += (a[i] ?? 0) * (b[i] ?? 0);
@@ -396,7 +792,8 @@ export function cosineSimilarity(a: EmbeddingVector, b: EmbeddingVector): number
 }
 
 async function embedBatch(model: string, inputs: string[]): Promise<number[][]> {
-	const response = await fetch("http://127.0.0.1:11434/api/embed", {
+	const embedUrl = process.env.QUAIL_OLLAMA_EMBED_URL ?? "http://127.0.0.1:11434/api/embed";
+	const response = await fetch(embedUrl, {
 		method: "POST",
 		headers: { "content-type": "application/json" },
 		body: JSON.stringify({ model, input: inputs }),
@@ -470,29 +867,124 @@ export function removeDataset(cwd: string, name: string): boolean {
 	const dir = datasetDir(cwd, slug);
 	if (!existsSync(dir)) return false;
 	rmSync(dir, { recursive: true, force: true });
+	loadedDatasetCache.delete(`${cwd}\0${slug}`);
 	writeRootManifest(cwd);
 	return true;
+}
+
+function buildFieldContains(fields: Record<string, FieldValue>, fieldTypes: Record<string, FieldType>): Record<string, string> {
+	return Object.fromEntries(
+		Object.entries(fields)
+			.filter(([field, value]) => fieldTypes[field] === "string" && typeof value === "string")
+			.map(([field, value]) => [field, normalizeContainsText(value as string)]),
+	);
+}
+
+function normalizeLoadedEntry(raw: QuailEntry, manifest?: QuailDatasetManifest): QuailEntry {
+	const rawRecord = raw as QuailEntry & { fields?: Record<string, FieldValue>; fieldContains?: Record<string, string> };
+	const fields: Record<string, FieldValue> = rawRecord.fields && typeof rawRecord.fields === "object"
+		? { ...rawRecord.fields }
+		: {
+			...(raw.text ? { [LEGACY_TEXT_FIELD]: raw.text } : {}),
+			...Object.fromEntries(Object.entries(raw.tags ?? {}).map(([field, value]) => [field, inferFieldValue(String(value))])),
+		};
+	const fieldTypes = manifest?.fieldTypes ?? inferFieldTypes([{ text: raw.text ?? "", fields, tags: raw.tags ?? {} }]);
+	const textFields = getStringFieldNames(fieldTypes);
+	const text = raw.text || buildDefaultText(fields, textFields);
+	return {
+		...raw,
+		text,
+		fields,
+		tags: raw.tags ?? {},
+		contains: raw.contains ?? normalizeContainsText(text),
+		fieldContains: rawRecord.fieldContains ?? buildFieldContains(fields, fieldTypes),
+	};
+}
+
+function getFieldNames(entries: QuailEntry[]): string[] {
+	return Array.from(new Set(entries.flatMap((entry) => Object.keys(entry.fields)))).sort();
+}
+
+function uniqueStrings(values: string[]): string[] {
+	return [...new Set(values)];
+}
+
+function getTextFieldNames(entries: QuailEntry[], fieldTypes?: Record<string, FieldType>): string[] {
+	if (fieldTypes) return getStringFieldNames(fieldTypes);
+	return getFieldNames(entries).filter((field) => entries.some((entry) => typeof entry.fields[field] === "string" && String(entry.fields[field]).trim().length > 0));
 }
 
 export function loadDataset(cwd: string, name: string): LoadedQuailDataset {
 	const slug = slugifyDatasetName(name);
 	const dir = datasetDir(cwd, slug);
-	if (!existsSync(join(dir, MANIFEST_FILE))) {
+	const manifestPath = join(dir, MANIFEST_FILE);
+	if (!existsSync(manifestPath)) {
 		throw new Error(`Dataset "${name}" is not processed in this Quail workspace`);
 	}
-	const manifest = readJson<QuailDatasetManifest>(join(dir, MANIFEST_FILE));
-	const entries = readFileSync(join(dir, manifest.files.entries), "utf8")
+	const manifest = readJson<QuailDatasetManifest>(manifestPath);
+	const entriesPath = join(dir, manifest.files.entries);
+	const bm25Path = join(dir, manifest.files.bm25);
+	const embeddingsPath = join(dir, manifest.files.embeddings);
+	const vectorPath = join(dir, EMBEDDINGS_VECTOR_FILE);
+	const cacheKey = `${cwd}\0${slug}`;
+	const manifestMtimeMs = getMtimeMs(manifestPath);
+	const entriesMtimeMs = getMtimeMs(entriesPath);
+	const bm25MtimeMs = getMtimeMs(bm25Path);
+	const embeddingsMtimeMs = getMtimeMs(embeddingsPath);
+	const vectorMtimeMs = existsSync(vectorPath) ? getMtimeMs(vectorPath) : undefined;
+	const cached = loadedDatasetCache.get(cacheKey);
+	if (
+		cached &&
+		cached.manifestMtimeMs === manifestMtimeMs &&
+		cached.entriesMtimeMs === entriesMtimeMs &&
+		cached.bm25MtimeMs === bm25MtimeMs &&
+		cached.embeddingsMtimeMs === embeddingsMtimeMs &&
+		cached.vectorMtimeMs === vectorMtimeMs
+	) {
+		return cached.dataset;
+	}
+	const entries = readFileSync(entriesPath, "utf8")
 		.split(/\r?\n/)
 		.map((line) => line.trim())
 		.filter(Boolean)
-		.map((line) => JSON.parse(line) as QuailEntry);
-	const bm25 = readJson<Bm25Index>(join(dir, manifest.files.bm25));
+		.map((line) => normalizeLoadedEntry(JSON.parse(line) as QuailEntry, manifest));
+	manifest.fieldNames ??= getFieldNames(entries);
+	manifest.fieldTypes ??= inferFieldTypes(entries.map((entry) => ({ text: entry.text, fields: entry.fields, tags: entry.tags })));
+	manifest.embeddedFields ??= getStringFieldNames(manifest.fieldTypes);
+	manifest.textFields ??= manifest.embeddedFields;
+	for (const entry of entries) {
+		const stringFields = manifest.embeddedFields ?? [];
+		entry.text = entry.text || buildDefaultText(entry.fields, stringFields);
+		entry.contains = normalizeContainsText(entry.text);
+		entry.fieldContains = buildFieldContains(entry.fields, manifest.fieldTypes);
+	}
+	const bm25 = readJson<Bm25Index>(bm25Path);
 	const embeddings = loadEmbeddingIndex(dir, manifest.files.embeddings);
-	return { manifest, entries, bm25, embeddings };
+	const dataset = { manifest, entries, bm25, embeddings };
+	loadedDatasetCache.set(cacheKey, {
+		manifestMtimeMs,
+		entriesMtimeMs,
+		bm25MtimeMs,
+		embeddingsMtimeMs,
+		vectorMtimeMs,
+		dataset,
+	});
+	return dataset;
 }
 
 export function loadDatasets(cwd: string, names: string[]): LoadedQuailDataset[] {
 	return names.map((name) => loadDataset(cwd, name));
+}
+
+export function inspectDatasetFile(options: {
+	inputPath: string;
+	format?: string;
+	textColumn?: string;
+	globalTags?: Record<string, string>;
+	fieldTypes?: Record<string, FieldTypeOverride>;
+}): DatasetInspection {
+	const parsed = parseCorpusFile(options.inputPath, { format: options.format, textColumn: options.textColumn });
+	return inspectParsedCorpus(parsed, { globalFields: options.globalTags, fieldTypes: options.fieldTypes });
 }
 
 export async function processDataset(options: ProcessDatasetOptions): Promise<QuailDatasetManifest> {
@@ -505,22 +997,40 @@ export async function processDataset(options: ProcessDatasetOptions): Promise<Qu
 	if (existsSync(join(dir, MANIFEST_FILE)) && !options.overwrite) {
 		throw new Error(`Dataset name must be unique. "${name}" already exists.`);
 	}
+	loadedDatasetCache.delete(`${cwd}\0${slug}`);
 	options.onProgress?.("[1/6] Reading and structuring corpus");
 	const parsed = parseCorpusFile(options.inputPath, { format: options.format, textColumn: options.textColumn });
 	if (parsed.length === 0) throw new Error("No entries found in corpus");
 	const globalTags = options.globalTags ?? {};
+	const prepared = withGlobalFields(parsed, globalTags);
+	const inspection = inspectParsedCorpus(prepared, { fieldTypes: options.fieldTypes });
+	const fieldTypes = inspection.fieldTypes;
+	const embeddedFields = inspection.embeddedFields;
 	const entries: QuailEntry[] = parsed.map((entry, index) => ({
-		id: stableEntryId(slug, index),
-		dataset: name,
-		ordinal: index + 1,
-		text: entry.text,
-		tags: { ...entry.tags, ...globalTags },
-		contains: normalizeContainsText(entry.text),
+		...(() => {
+			const rawFields: Record<string, FieldValue> = {
+				...entry.fields,
+				...globalTags,
+			};
+			const fields = coerceFields(rawFields, fieldTypes);
+			const text = buildDefaultText(fields, embeddedFields);
+			return {
+				id: stableEntryId(slug, index),
+				dataset: name,
+				ordinal: index + 1,
+				text,
+				fields,
+				tags: { ...entry.tags },
+				contains: normalizeContainsText(text),
+				fieldContains: buildFieldContains(fields, fieldTypes),
+			};
+		})(),
 	}));
-	const metadataFields = Array.from(new Set(entries.flatMap((entry) => Object.keys(entry.tags)))).sort();
+	const metadataFields = Array.from(new Set(entries.flatMap((entry) => Object.keys(entry.fields)))).sort();
+	const textFields = getTextFieldNames(entries, fieldTypes);
 
 	options.onProgress?.("[2/6] Building BM25 preprocessing index");
-	const bm25 = buildBm25Index(entries);
+	const bm25 = buildBm25Index(entries, fieldTypes);
 
 	options.onProgress?.("[3/6] Preparing exact contains search text");
 	// Exact string search uses the per-entry normalized `contains` field written below.
@@ -533,14 +1043,15 @@ export async function processDataset(options: ProcessDatasetOptions): Promise<Qu
 		embeddingIndex = { model: embeddingModel, dimensions: 0, vectors: {} };
 	} else {
 		options.onProgress?.(`[4/6] Embedding with Ollama model ${embeddingModel} at batch size ${batchSize}`);
+		const embeddingDocs = getEmbeddingDocuments(entries, fieldTypes);
 		const byPosition = await embedTexts(
-			entries.map((entry) => entry.text),
+			embeddingDocs.map(([, text]) => text),
 			{ model: embeddingModel, batchSize, onProgress: options.onProgress },
 		);
 		embeddingIndex = {
 			model: byPosition.model,
 			dimensions: byPosition.dimensions,
-			vectors: Object.fromEntries(entries.map((entry, index) => [entry.id, byPosition.vectors[String(index)] ?? []])),
+			vectors: Object.fromEntries(embeddingDocs.map(([docId], index) => [docId, byPosition.vectors[String(index)] ?? []])),
 		};
 	}
 
@@ -557,6 +1068,10 @@ export async function processDataset(options: ProcessDatasetOptions): Promise<Qu
 		updatedAt: now,
 		entryCount: entries.length,
 		metadataFields,
+		fieldNames: metadataFields,
+		textFields,
+		fieldTypes,
+		embeddedFields,
 		embeddingModel,
 		embeddingDimensions: embeddingIndex.dimensions,
 		batchSize,

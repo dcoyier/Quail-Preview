@@ -1204,6 +1204,9 @@ export class AgentSession {
     getAvailableThinkingLevels() {
         if (!this.supportsThinking())
             return ["off"];
+        const modelThinkingLevels = this.model?.thinkingLevels;
+        if (modelThinkingLevels && modelThinkingLevels.length > 0)
+            return modelThinkingLevels;
         return this.supportsXhighThinking() ? THINKING_LEVELS_WITH_XHIGH : THINKING_LEVELS;
     }
     /**

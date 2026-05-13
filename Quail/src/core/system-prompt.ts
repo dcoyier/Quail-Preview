@@ -65,8 +65,6 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 				prompt += `## ${filePath}\n\n${content}\n\n`;
 			}
 		}
-		prompt += `\nCurrent date: ${date}`;
-		prompt += `\nCurrent working directory: ${promptCwd}`;
 		return prompt;
 	}
 
@@ -92,9 +90,11 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 			prompt += formatSkillsForPrompt(skills);
 		}
 
-		// Add date and working directory last
-		prompt += `\nCurrent date: ${date}`;
-		prompt += `\nCurrent working directory: ${promptCwd}`;
+		// Add date and working directory last for the generic coding-agent prompt.
+		if (APP_NAME !== "quail") {
+			prompt += `\nCurrent date: ${date}`;
+			prompt += `\nCurrent working directory: ${promptCwd}`;
+		}
 
 		return prompt;
 	}

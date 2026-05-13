@@ -6,6 +6,7 @@ import chalk from "chalk";
 import { minimatch } from "minimatch";
 import { isValidThinkingLevel } from "../cli/args.js";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js";
+import { DEFAULT_OLLAMA_MODEL, OLLAMA_PROVIDER } from "./ollama-provider.js";
 /** Default model IDs for each known provider */
 export const defaultModelPerProvider = {
     "amazon-bedrock": "us.anthropic.claude-opus-4-6-v1",
@@ -33,6 +34,7 @@ export const defaultModelPerProvider = {
     opencode: "kimi-k2.6",
     "opencode-go": "kimi-k2.6",
     "kimi-coding": "kimi-for-coding",
+    [OLLAMA_PROVIDER]: DEFAULT_OLLAMA_MODEL,
 };
 /**
  * Helper to check if a model ID looks like an alias (no date suffix)
