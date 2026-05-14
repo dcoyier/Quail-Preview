@@ -39,7 +39,7 @@ UNIT
 
 REGEX
 - options: find(re), remove(re), splice(i, j)
-- description: re is a python regular expression. Use r"". find() returns a list of strings that match the regular expression. remove() and splice() just return the modified element. splice() takes in indices i and j. REGEX commands can be changed such as find(re).remove(re).splice(i, j)
+- description: re is a python regular expression. Use r"". find() returns a list of strings that match the regular expression. remove() and splice() just return the modified string. splice() takes in indices i and j. REGEX commands can be changed such as find(re).remove(re).splice(i, j). Do not use re. calls, rely, follow, and trust what is described here. Chaining remove() or splice() after a find() modifies all elements
 
 GROUP-EXPR = (GROUP and GROUP and not GROUP or GROUP or not GROUP ... )
 - description: groups are combined using intersection, union or complementation. Groups are sets of entries or fields. The scope of each group must be the same in a group expression. A group expression can just be a single group. Each GROUP could instead be a GROUP-EXPR; these can be nested. A GROUP-EXPR is a set of entries or fields, so any list of entries [ID, ID, ID] or fields [FIELD, FIELD, FIELD] could be used instead
@@ -63,7 +63,7 @@ FUNCTION
     1. ACCUMULATION-INPUT MODE similarity to " "
     2. ACCUMULATION-INPUT per ACCUMULATION-TEST MODE similarity to [" ", " "]
     3. length
-- description: option 1 is for computing similarity to a single string. Option 2 is for computing total similarity to a set of strings and finding the avg/total of those similarities. Note that a set of strings is used in option 2, and groups are sets, so a proper group expression could be used here. Infer types elsewhere to use these primitives throughout DSL execution. Option 3 is for the length of a list, only viable if the input was a string, which would only be the case if the REGEX was a find(). All options are viable if the REGEX used find()
+- description: option 1 is for computing similarity to a single string. Option 2 is for computing total similarity to a set of strings and finding the avg/total of those similarities. Note that a set of strings is used in option 2, and groups are sets, so a proper group expression could be used here. Infer types elsewhere to use these primitives throughout DSL execution. Option 3 is for the length of a list, only viable if the input was a list, which would only be the case if the REGEX was a find(). All options are viable if the REGEX used find()
 
 MODE
 - options: BM25, embed
