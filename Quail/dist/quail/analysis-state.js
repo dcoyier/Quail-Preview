@@ -3,10 +3,12 @@ export const QUAIL_ANALYSIS_RESULT_MESSAGE = "quail.analysis_result";
 export function createEmptyAnalysisState() {
     return {
         version: 1,
-        nextGroupNumber: 1,
+        nextGroupNumber: 2,
         groups: {},
         tagsByEntry: {},
         variables: {},
+        createdFields: [],
+        pythonBindings: [],
     };
 }
 function isAnalysisState(value) {

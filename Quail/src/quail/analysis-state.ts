@@ -6,26 +6,39 @@ export const QUAIL_ANALYSIS_RESULT_MESSAGE = "quail.analysis_result";
 export interface QuailGroupState {
 	id: string;
 	datasets: string[];
+	scope: "entries" | "fields";
 	spec: string;
-	entryIds: string[];
+	members: string[];
+	entryIds?: string[];
+	fieldNames?: string[];
 	createdAt: string;
+}
+
+export interface QuailPythonBindingState {
+	name: string;
+	kind: "function" | "class";
+	source: string;
 }
 
 export interface QuailAnalysisState {
 	version: 1;
 	nextGroupNumber: number;
 	groups: Record<string, QuailGroupState>;
-	tagsByEntry: Record<string, Record<string, string | string[]>>;
+	tagsByEntry: Record<string, Record<string, unknown>>;
 	variables: Record<string, unknown>;
+	createdFields?: string[];
+	pythonBindings?: QuailPythonBindingState[];
 }
 
 export function createEmptyAnalysisState(): QuailAnalysisState {
 	return {
 		version: 1,
-		nextGroupNumber: 1,
+		nextGroupNumber: 2,
 		groups: {},
 		tagsByEntry: {},
 		variables: {},
+		createdFields: [],
+		pythonBindings: [],
 	};
 }
 

@@ -18,6 +18,7 @@ export interface QuailQueryToolDetails {
     datasets: string[];
     blocks: number;
     hasErrors: boolean;
+    executionTimeMs: number;
     outputPreviewLines: number;
     outputLineCount: number;
 }

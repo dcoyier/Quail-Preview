@@ -83,6 +83,7 @@ export function createQuailQueryToolDefinition(cwd, sessionManager, options = {}
             "For questions about activated Quail datasets, call quail instead of writing DSL blocks as plain text.",
             "Pass dataset names through the datasets argument and DSL statements through code; do not include $ wrappers or @ dataset lines.",
             "Use print() for any values that should be returned in the tool result.",
+            "When inspecting source fields for multiple entries, retrieve entry ids first and call get(ids) once; avoid loops that call get(id) per entry.",
         ],
         parameters: quailQuerySchema,
         executionMode: "sequential",
@@ -104,7 +105,9 @@ export function createQuailQueryToolDefinition(cwd, sessionManager, options = {}
                 code,
                 raw: `$\n@${datasets.map((name) => `"${name}"`).join(", ")}\n${code}\n$`,
             };
+            const startedAt = performance.now();
             const result = await executeQuailCallBlocks({ cwd, state, blocks: [block] });
+            const executionTimeMs = Math.round(performance.now() - startedAt);
             sessionManager.appendCustomEntry(QUAIL_ANALYSIS_STATE_ENTRY, result.state);
             const output = formatQuailExecutionResult(result);
             return {
@@ -113,6 +116,7 @@ export function createQuailQueryToolDefinition(cwd, sessionManager, options = {}
                     datasets,
                     blocks: result.blocks,
                     hasErrors: result.errors.length > 0,
+                    executionTimeMs,
                     outputPreviewLines,
                     outputLineCount: countLines(output),
                 },

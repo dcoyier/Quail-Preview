@@ -2,7 +2,7 @@ import { existsSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import chalk from "chalk";
 import { ensureQuailWorkspace, getQuailDatasetsDir, getQuailStagingDir } from "./paths.js";
-import { datasetExists, inspectDatasetFile, listDatasets, processDataset, removeDataset } from "./dataset-store.js";
+import { defaultEmbeddingBatchSize, defaultEmbeddingConcurrency, defaultEmbeddingModel, datasetExists, inspectDatasetFile, listDatasets, processDataset, removeDataset, } from "./dataset-store.js";
 function printDatasetHelp() {
     console.log(`Quail dataset commands
 
@@ -16,13 +16,18 @@ Usage:
 Options:
   --format <auto|txt|csv|tsv|json|jsonl>
   --text-column <column>                Legacy preview hint; embedding is type-driven
-  --model <ollama embedding model>      Default: embeddinggemma:latest
-  --batch-size <n>                      Default: 64
+  --model <embedding model>             Default: ${defaultEmbeddingModel()}
+  --batch-size <n>                      Default: ${defaultEmbeddingBatchSize()}
+  --embedding-concurrency <n>           Default: ${defaultEmbeddingConcurrency()}
   --tag <field=value>                   Can be repeated; added to every entry as a source field
   --field-type <field=type>             Override inferred type; type is string, int, float, bool, list, object, mixed, or null
   --dry-run                             Inspect fields without writing a processed dataset
   --overwrite                           Replace an existing dataset of the same name
   --skip-embeddings                     Only for repair/debug workflows
+
+Embedding defaults:
+  Provider: OpenRouter; set OPENROUTER_API_KEY or QUAIL_OPENROUTER_API_KEY
+  Set QUAIL_EMBEDDING_PROVIDER=ollama to use an Ollama-compatible /api/embed endpoint
 `);
 }
 function parseKeyValue(value) {
@@ -80,6 +85,14 @@ function parseDatasetArgs(args) {
             if (!Number.isFinite(batchSize) || batchSize <= 0)
                 throw new Error("--batch-size must be a positive integer");
             parsed.batchSize = batchSize;
+            i++;
+        }
+        else if (arg === "--embedding-concurrency" && next !== undefined) {
+            const embeddingConcurrency = Number.parseInt(next, 10);
+            if (!Number.isFinite(embeddingConcurrency) || embeddingConcurrency <= 0) {
+                throw new Error("--embedding-concurrency must be a positive integer");
+            }
+            parsed.embeddingConcurrency = embeddingConcurrency;
             i++;
         }
         else if (arg === "--tag" && next !== undefined) {
@@ -195,6 +208,7 @@ export async function handleDatasetCommand(args, cwd = process.cwd()) {
                     textColumn: parsed.textColumn,
                     model: parsed.model,
                     batchSize: parsed.batchSize,
+                    embeddingConcurrency: parsed.embeddingConcurrency,
                     globalTags: parsed.tags,
                     fieldTypes: parsed.fieldTypes,
                     overwrite: parsed.overwrite,

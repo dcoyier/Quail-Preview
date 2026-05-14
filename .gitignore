@@ -1,6 +1,8 @@
 .DS_Store
 node_modules/
 workspace/
+openrouter.env
+Quail/openrouter.env
 
 Quail-v0.7-portable.zip
 *.zip

@@ -11,7 +11,7 @@ import {
 	writeFileSync,
 	writeSync,
 } from "node:fs";
-import { basename, extname, join } from "node:path";
+import { basename, dirname, extname, join, resolve } from "node:path";
 import { ensureQuailWorkspace, getQuailDatasetsDir, getQuailWorkspaceDir } from "./paths.js";
 import { normalizeContainsText, slugifyDatasetName, stableEntryId, tokenize } from "./text.js";
 
@@ -116,6 +116,7 @@ export interface ProcessDatasetOptions {
 	textColumn?: string;
 	model?: string;
 	batchSize?: number;
+	embeddingConcurrency?: number;
 	globalTags?: Record<string, string>;
 	fieldTypes?: Record<string, FieldTypeOverride>;
 	skipEmbeddings?: boolean;
@@ -138,11 +139,29 @@ const EMBEDDINGS_FILE = "embeddings.json";
 const EMBEDDINGS_VECTOR_FILE = "embeddings.f32";
 const MANIFEST_FILE = "manifest.json";
 const ROOT_MANIFEST_FILE = "manifest.json";
-const DEFAULT_EMBEDDING_MODEL = "embeddinggemma:latest";
-const DEFAULT_BATCH_SIZE = 64;
+export const DEFAULT_EMBEDDING_MODEL = "qwen/qwen3-embedding-8b";
+export const DEFAULT_EMBEDDING_PROVIDER = "openrouter";
+export const DEFAULT_BATCH_SIZE = 256;
+export const DEFAULT_OPENROUTER_EMBEDDING_CONCURRENCY = 20;
+export const DEFAULT_OLLAMA_EMBEDDING_CONCURRENCY = 1;
+export const DEFAULT_EMBEDDING_MAX_RETRIES = 6;
+const DEFAULT_OPENROUTER_EMBED_URL = "https://openrouter.ai/api/v1/embeddings";
+const DEFAULT_OLLAMA_EMBED_URL = "http://127.0.0.1:11434/api/embed";
+const DEFAULT_EMBEDDING_RETRY_BASE_MS = 500;
 const DEFAULT_MAX_EAGER_VECTOR_FILE_BYTES = 1.5 * 1024 * 1024 * 1024;
 const FIELD_DOC_SEPARATOR = "\u0000";
 const LEGACY_TEXT_FIELD = "text";
+const LOCAL_EMBEDDING_ENV_FILE = "openrouter.env";
+const LOCAL_EMBEDDING_ENV_DISABLE = "QUAIL_DISABLE_LOCAL_EMBEDDING_ENV";
+
+type EmbeddingProvider = "openrouter" | "ollama";
+
+interface EmbeddingBackendConfig {
+	provider: EmbeddingProvider;
+	model: string;
+	url: string;
+	providerOnly?: string;
+}
 
 interface LoadedDatasetCacheEntry {
 	manifestMtimeMs: number;
@@ -154,6 +173,7 @@ interface LoadedDatasetCacheEntry {
 }
 
 const loadedDatasetCache = new Map<string, LoadedDatasetCacheEntry>();
+const loadedLocalEmbeddingEnvFiles = new Set<string>();
 
 function datasetDir(cwd: string, slug: string): string {
 	return join(getQuailDatasetsDir(cwd), slug);
@@ -212,6 +232,133 @@ function maxEagerVectorFileBytes(): number {
 
 function hasDotProduct(vector: EmbeddingVector): vector is DotProductEmbeddingVector {
 	return typeof (vector as Partial<DotProductEmbeddingVector>).dotProduct === "function";
+}
+
+function stripEnvValueQuotes(value: string): string {
+	if (value.length >= 2 && ((value.startsWith("\"") && value.endsWith("\"")) || (value.startsWith("'") && value.endsWith("'")))) {
+		return value.slice(1, -1);
+	}
+	return value;
+}
+
+function loadLocalEmbeddingEnvFile(path: string): void {
+	if (loadedLocalEmbeddingEnvFiles.has(path)) return;
+	if (!existsSync(path)) return;
+	const text = readFileSync(path, "utf8");
+	for (const rawLine of text.split(/\r?\n/)) {
+		const line = rawLine.trim();
+		if (!line || line.startsWith("#")) continue;
+		const assignment = line.startsWith("export ") ? line.slice("export ".length).trim() : line;
+		const index = assignment.indexOf("=");
+		if (index <= 0) continue;
+		const key = assignment.slice(0, index).trim();
+		if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key) || process.env[key] !== undefined) continue;
+		process.env[key] = stripEnvValueQuotes(assignment.slice(index + 1).trim());
+	}
+	loadedLocalEmbeddingEnvFiles.add(path);
+}
+
+function localEmbeddingEnvCandidatePaths(cwd: string): string[] {
+	const dir = resolve(cwd);
+	const parent = dirname(dir);
+	return Array.from(new Set([
+		join(dir, LOCAL_EMBEDDING_ENV_FILE),
+		join(dir, "Quail", LOCAL_EMBEDDING_ENV_FILE),
+		join(parent, LOCAL_EMBEDDING_ENV_FILE),
+		join(parent, "Quail", LOCAL_EMBEDDING_ENV_FILE),
+	]));
+}
+
+export function loadLocalEmbeddingEnv(cwd = process.cwd()): void {
+	if (process.env[LOCAL_EMBEDDING_ENV_DISABLE]?.trim() === "1") return;
+	for (const path of localEmbeddingEnvCandidatePaths(cwd)) loadLocalEmbeddingEnvFile(path);
+}
+
+function envValue(name: string): string | undefined {
+	loadLocalEmbeddingEnv();
+	const value = process.env[name]?.trim();
+	return value ? value : undefined;
+}
+
+export function defaultEmbeddingModel(): string {
+	return envValue("QUAIL_EMBEDDING_MODEL") ?? DEFAULT_EMBEDDING_MODEL;
+}
+
+export function defaultEmbeddingBatchSize(): number {
+	const value = envValue("QUAIL_EMBEDDING_BATCH_SIZE");
+	if (!value) return DEFAULT_BATCH_SIZE;
+	const parsed = Number.parseInt(value, 10);
+	return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_BATCH_SIZE;
+}
+
+export function defaultEmbeddingConcurrency(): number {
+	const fallback = embeddingProvider() === "openrouter"
+		? DEFAULT_OPENROUTER_EMBEDDING_CONCURRENCY
+		: DEFAULT_OLLAMA_EMBEDDING_CONCURRENCY;
+	const value = envValue("QUAIL_EMBEDDING_CONCURRENCY");
+	if (!value) return fallback;
+	const parsed = Number.parseInt(value, 10);
+	return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function defaultEmbeddingMaxRetries(): number {
+	const value = envValue("QUAIL_EMBEDDING_MAX_RETRIES");
+	if (!value) return DEFAULT_EMBEDDING_MAX_RETRIES;
+	const parsed = Number.parseInt(value, 10);
+	return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_EMBEDDING_MAX_RETRIES;
+}
+
+function defaultEmbeddingRetryBaseMs(): number {
+	const value = envValue("QUAIL_EMBEDDING_RETRY_BASE_MS");
+	if (!value) return DEFAULT_EMBEDDING_RETRY_BASE_MS;
+	const parsed = Number.parseInt(value, 10);
+	return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_EMBEDDING_RETRY_BASE_MS;
+}
+
+function embeddingProvider(): EmbeddingProvider {
+	const value = envValue("QUAIL_EMBEDDING_PROVIDER")?.toLowerCase();
+	if (value === "ollama") return "ollama";
+	if (value && value !== DEFAULT_EMBEDDING_PROVIDER) {
+		throw new Error(`Unsupported QUAIL_EMBEDDING_PROVIDER "${value}". Use "openrouter" or "ollama".`);
+	}
+	return DEFAULT_EMBEDDING_PROVIDER;
+}
+
+function openRouterEmbedUrl(): string {
+	const explicitUrl = envValue("QUAIL_OPENROUTER_EMBED_URL");
+	if (explicitUrl) return explicitUrl;
+	const baseUrl = envValue("QUAIL_OPENROUTER_BASE_URL");
+	if (!baseUrl) return DEFAULT_OPENROUTER_EMBED_URL;
+	return `${baseUrl.replace(/\/+$/, "")}/embeddings`;
+}
+
+function getEmbeddingBackendConfig(model: string): EmbeddingBackendConfig {
+	const provider = embeddingProvider();
+	if (provider === "ollama") {
+		return {
+			provider,
+			model,
+			url: envValue("QUAIL_OLLAMA_EMBED_URL") ?? DEFAULT_OLLAMA_EMBED_URL,
+		};
+	}
+	return {
+		provider,
+		model,
+		url: openRouterEmbedUrl(),
+		providerOnly: envValue("QUAIL_OPENROUTER_PROVIDER_ONLY"),
+	};
+}
+
+export function embeddingBackendCacheKey(model: string): string {
+	const config = getEmbeddingBackendConfig(model);
+	return [config.provider, config.model, config.url, config.providerOnly ?? ""].join("\0");
+}
+
+export function embeddingBackendDescription(model = defaultEmbeddingModel()): string {
+	const config = getEmbeddingBackendConfig(model);
+	if (config.provider === "ollama") return `Ollama-compatible endpoint ${config.url} with model ${config.model}`;
+	const providerText = config.providerOnly ? ` via provider ${config.providerOnly}` : "";
+	return `OpenRouter model ${config.model}${providerText}`;
 }
 
 class FileBackedEmbeddingVector implements DotProductEmbeddingVector {
@@ -834,10 +981,62 @@ export function bm25ScoreTerms(index: Bm25Index, entryId: string, terms: readonl
 	return score;
 }
 
-function l2Normalize(vector: number[]): number[] {
-	const norm = Math.sqrt(vector.reduce((sum, value) => sum + value * value, 0));
-	if (!Number.isFinite(norm) || norm === 0) return vector;
-	return vector.map((value) => value / norm);
+function l2Normalize(vector: number[]): Float32Array {
+	let sumSquares = 0;
+	for (const value of vector) sumSquares += value * value;
+	const norm = Math.sqrt(sumSquares);
+	const out = new Float32Array(vector.length);
+	if (!Number.isFinite(norm) || norm === 0) {
+		out.set(vector);
+		return out;
+	}
+	for (let i = 0; i < vector.length; i++) out[i] = vector[i] / norm;
+	return out;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+	return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : undefined;
+}
+
+function numberVector(value: unknown): number[] | undefined {
+	if (!Array.isArray(value)) return undefined;
+	const vector = value.map((item) => Number(item));
+	return vector.every(Number.isFinite) ? vector : undefined;
+}
+
+function embeddingVectors(value: unknown): number[][] | undefined {
+	if (!Array.isArray(value)) return undefined;
+	const vectors = value.map(numberVector);
+	if (vectors.some((vector) => vector === undefined)) return undefined;
+	return vectors as number[][];
+}
+
+function parseOllamaEmbeddingResponse(data: unknown): number[][] | undefined {
+	const record = asRecord(data);
+	if (!record) return undefined;
+	const embeddings = embeddingVectors(record.embeddings);
+	if (embeddings) return embeddings;
+	const embedding = numberVector(record.embedding);
+	if (embedding) return [embedding];
+	return undefined;
+}
+
+function parseOpenRouterEmbeddingResponse(data: unknown): number[][] | undefined {
+	const record = asRecord(data);
+	if (!record) return undefined;
+	const rows = Array.isArray(record.data)
+		? record.data.map((item, fallbackIndex) => {
+				const row = asRecord(item);
+				const embedding = numberVector(row?.embedding);
+				if (!embedding) return undefined;
+				const index = typeof row?.index === "number" && Number.isInteger(row.index) ? row.index : fallbackIndex;
+				return { index, embedding };
+			})
+		: undefined;
+	if (rows && rows.every((row): row is { index: number; embedding: number[] } => row !== undefined)) {
+		return [...rows].sort((a, b) => a.index - b.index).map((row) => row.embedding);
+	}
+	return parseOllamaEmbeddingResponse(data);
 }
 
 export function cosineSimilarity(a: EmbeddingVector, b: EmbeddingVector): number {
@@ -876,40 +1075,127 @@ export function scoreEmbeddingVectorValues(vectors: ReadonlyArray<EmbeddingVecto
 	return scores;
 }
 
-async function embedBatch(model: string, inputs: string[]): Promise<number[][]> {
-	const embedUrl = process.env.QUAIL_OLLAMA_EMBED_URL ?? "http://127.0.0.1:11434/api/embed";
-	const response = await fetch(embedUrl, {
+class EmbeddingBackendError extends Error {
+	constructor(
+		message: string,
+		readonly retryable = true,
+	) {
+		super(message);
+	}
+}
+
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function embeddingRetryDelayMs(attempt: number): number {
+	const base = defaultEmbeddingRetryBaseMs();
+	if (base <= 0) return 0;
+	const capped = Math.min(30_000, base * (2 ** Math.max(0, attempt - 1)));
+	return capped + Math.floor(Math.random() * Math.min(250, base));
+}
+
+function shouldRetryEmbeddingError(error: unknown): boolean {
+	if (error instanceof EmbeddingBackendError) return error.retryable;
+	if (!(error instanceof Error)) return true;
+	return !/OPENROUTER_API_KEY|QUAIL_OPENROUTER_API_KEY|Unsupported QUAIL_EMBEDDING_PROVIDER/.test(error.message);
+}
+
+async function embedOllamaBatch(config: EmbeddingBackendConfig, inputs: string[]): Promise<EmbeddingVector[]> {
+	const response = await fetch(config.url, {
 		method: "POST",
 		headers: { "content-type": "application/json" },
-		body: JSON.stringify({ model, input: inputs }),
+		body: JSON.stringify({ model: config.model, input: inputs }),
 	});
 	if (!response.ok) {
 		const text = await response.text().catch(() => "");
-		throw new Error(`Ollama embed failed (${response.status}): ${text || response.statusText}`);
+		throw new EmbeddingBackendError(`Ollama-compatible embed failed (${response.status}): ${text || response.statusText}`, response.status >= 500);
 	}
-	const data = (await response.json()) as { embeddings?: number[][]; embedding?: number[] };
-	if (Array.isArray(data.embeddings)) return data.embeddings.map(l2Normalize);
-	if (Array.isArray(data.embedding)) return [l2Normalize(data.embedding)];
-	throw new Error("Ollama embed response did not include embeddings");
+	const embeddings = parseOllamaEmbeddingResponse(await response.json());
+	if (embeddings) return embeddings.map(l2Normalize);
+	throw new EmbeddingBackendError("Ollama-compatible embed response did not include embeddings");
+}
+
+async function embedOpenRouterBatch(config: EmbeddingBackendConfig, inputs: string[]): Promise<EmbeddingVector[]> {
+	const apiKey = envValue("QUAIL_OPENROUTER_API_KEY") ?? envValue("OPENROUTER_API_KEY");
+	if (!apiKey) {
+		throw new EmbeddingBackendError("OpenRouter embeddings require OPENROUTER_API_KEY or QUAIL_OPENROUTER_API_KEY.", false);
+	}
+	const body: Record<string, unknown> = { model: config.model, input: inputs };
+	if (config.providerOnly) body.provider = { only: [config.providerOnly] };
+	const response = await fetch(config.url, {
+		method: "POST",
+		headers: {
+			"authorization": `Bearer ${apiKey}`,
+			"content-type": "application/json",
+			"http-referer": "https://github.com/quail",
+			"x-title": "Quail v0.7",
+		},
+		body: JSON.stringify(body),
+	});
+	if (!response.ok) {
+		const text = await response.text().catch(() => "");
+		throw new EmbeddingBackendError(`OpenRouter embed failed (${response.status}): ${text || response.statusText}`, response.status === 429 || response.status >= 500);
+	}
+	const embeddings = parseOpenRouterEmbeddingResponse(await response.json());
+	if (embeddings) return embeddings.map(l2Normalize);
+	throw new EmbeddingBackendError("OpenRouter embed response did not include embeddings");
+}
+
+async function embedBatchOnce(model: string, inputs: string[]): Promise<EmbeddingVector[]> {
+	const config = getEmbeddingBackendConfig(model);
+	if (config.provider === "ollama") return embedOllamaBatch(config, inputs);
+	return embedOpenRouterBatch(config, inputs);
+}
+
+async function embedBatch(model: string, inputs: string[]): Promise<EmbeddingVector[]> {
+	const maxRetries = defaultEmbeddingMaxRetries();
+	let lastError: unknown;
+	for (let attempt = 0; attempt <= maxRetries; attempt++) {
+		try {
+			const embeddings = await embedBatchOnce(model, inputs);
+			if (embeddings.length !== inputs.length) {
+				throw new EmbeddingBackendError(`Embedding backend returned ${embeddings.length} embedding(s) for ${inputs.length} input(s).`);
+			}
+			return embeddings;
+		} catch (error) {
+			lastError = error;
+			if (attempt >= maxRetries || !shouldRetryEmbeddingError(error)) throw error;
+			await sleep(embeddingRetryDelayMs(attempt + 1));
+		}
+	}
+	throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
 export async function embedTexts(
 	texts: string[],
-	options?: { model?: string; batchSize?: number; onProgress?: (message: string) => void },
+	options?: { model?: string; batchSize?: number; concurrency?: number; onProgress?: (message: string) => void },
 ): Promise<EmbeddingIndex> {
-	const model = options?.model ?? DEFAULT_EMBEDDING_MODEL;
-	const batchSize = options?.batchSize ?? DEFAULT_BATCH_SIZE;
-	const vectors: Record<string, number[]> = {};
+	const model = options?.model ?? defaultEmbeddingModel();
+	const batchSize = options?.batchSize ?? defaultEmbeddingBatchSize();
+	const concurrency = Math.max(1, Math.floor(options?.concurrency ?? defaultEmbeddingConcurrency()));
+	const vectors: Record<string, EmbeddingVector> = {};
 	let dimensions = 0;
+	const batches: Array<{ start: number; inputs: string[] }> = [];
 	for (let start = 0; start < texts.length; start += batchSize) {
-		const batch = texts.slice(start, start + batchSize);
-		options?.onProgress?.(`Embedding entries ${start + 1}-${start + batch.length} of ${texts.length}`);
-		const embeddings = await embedBatch(model, batch);
-		for (let i = 0; i < embeddings.length; i++) {
-			vectors[String(start + i)] = embeddings[i];
-			dimensions = Math.max(dimensions, embeddings[i].length);
-		}
+		batches.push({ start, inputs: texts.slice(start, start + batchSize) });
 	}
+	let nextBatchIndex = 0;
+	const embedNextBatch = async (): Promise<void> => {
+		while (true) {
+			const batchIndex = nextBatchIndex++;
+			const batchSpec = batches[batchIndex];
+			if (!batchSpec) return;
+			const { start, inputs: batch } = batchSpec;
+			options?.onProgress?.(`Embedding entries ${start + 1}-${start + batch.length} of ${texts.length}`);
+			const embeddings = await embedBatch(model, batch);
+			for (let i = 0; i < embeddings.length; i++) {
+				vectors[String(start + i)] = embeddings[i];
+				dimensions = Math.max(dimensions, embeddings[i].length);
+			}
+		}
+	};
+	await Promise.all(Array.from({ length: Math.min(concurrency, batches.length) }, () => embedNextBatch()));
 	return { model, dimensions, vectors };
 }
 
@@ -1074,6 +1360,7 @@ export function inspectDatasetFile(options: {
 
 export async function processDataset(options: ProcessDatasetOptions): Promise<QuailDatasetManifest> {
 	const cwd = options.cwd;
+	loadLocalEmbeddingEnv(cwd);
 	const name = options.name.trim();
 	if (!name) throw new Error("Dataset name is required");
 	ensureQuailWorkspace(cwd);
@@ -1120,18 +1407,21 @@ export async function processDataset(options: ProcessDatasetOptions): Promise<Qu
 	options.onProgress?.("[3/6] Preparing exact contains search text");
 	// Exact string search uses the per-entry normalized `contains` field written below.
 
-	const embeddingModel = options.model ?? DEFAULT_EMBEDDING_MODEL;
-	const batchSize = options.batchSize ?? DEFAULT_BATCH_SIZE;
+	const embeddingModel = options.model ?? defaultEmbeddingModel();
+	const batchSize = options.batchSize ?? defaultEmbeddingBatchSize();
+	const embeddingConcurrency = options.embeddingConcurrency ?? defaultEmbeddingConcurrency();
 	let embeddingIndex: EmbeddingIndex;
 	if (options.skipEmbeddings) {
 		options.onProgress?.("[4/6] Skipping embeddings by request");
 		embeddingIndex = { model: embeddingModel, dimensions: 0, vectors: {} };
 	} else {
-		options.onProgress?.(`[4/6] Embedding with Ollama model ${embeddingModel} at batch size ${batchSize}`);
+		options.onProgress?.(
+			`[4/6] Embedding with ${embeddingBackendDescription(embeddingModel)} at batch size ${batchSize}, concurrency ${embeddingConcurrency}`,
+		);
 		const embeddingDocs = getEmbeddingDocuments(entries, fieldTypes);
 		const byPosition = await embedTexts(
 			embeddingDocs.map(([, text]) => text),
-			{ model: embeddingModel, batchSize, onProgress: options.onProgress },
+			{ model: embeddingModel, batchSize, concurrency: embeddingConcurrency, onProgress: options.onProgress },
 		);
 		embeddingIndex = {
 			model: byPosition.model,

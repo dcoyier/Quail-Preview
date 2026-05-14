@@ -87,6 +87,7 @@ export interface ProcessDatasetOptions {
     textColumn?: string;
     model?: string;
     batchSize?: number;
+    embeddingConcurrency?: number;
     globalTags?: Record<string, string>;
     fieldTypes?: Record<string, FieldTypeOverride>;
     skipEmbeddings?: boolean;
@@ -101,8 +102,20 @@ export interface DatasetListItem {
     metadataFields: string[];
     createdAt: string;
 }
+export declare const DEFAULT_EMBEDDING_MODEL = "qwen/qwen3-embedding-8b";
+export declare const DEFAULT_EMBEDDING_PROVIDER = "openrouter";
+export declare const DEFAULT_BATCH_SIZE = 256;
+export declare const DEFAULT_OPENROUTER_EMBEDDING_CONCURRENCY = 20;
+export declare const DEFAULT_OLLAMA_EMBEDDING_CONCURRENCY = 1;
+export declare const DEFAULT_EMBEDDING_MAX_RETRIES = 6;
 export declare function fieldDocumentId(entryId: string, field: string): string;
 export declare function fieldValueToText(value: unknown): string;
+export declare function loadLocalEmbeddingEnv(cwd?: string): void;
+export declare function defaultEmbeddingModel(): string;
+export declare function defaultEmbeddingBatchSize(): number;
+export declare function defaultEmbeddingConcurrency(): number;
+export declare function embeddingBackendCacheKey(model: string): string;
+export declare function embeddingBackendDescription(model?: string): string;
 export declare function parseCorpusFile(inputPath: string, options?: {
     format?: string;
     textColumn?: string;
@@ -115,6 +128,7 @@ export declare function scoreEmbeddingVectorValues(vectors: ReadonlyArray<Embedd
 export declare function embedTexts(texts: string[], options?: {
     model?: string;
     batchSize?: number;
+    concurrency?: number;
     onProgress?: (message: string) => void;
 }): Promise<EmbeddingIndex>;
 export declare function datasetExists(cwd: string, name: string): boolean;

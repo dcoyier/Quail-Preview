@@ -1,6 +1,7 @@
 import { fuzzyFilter, Text, } from "@mariozechner/pi-tui";
 import { theme } from "../../modes/interactive/theme/theme.js";
 import { listDatasets } from "../../quail/dataset-store.js";
+import { getDatasetMentionAliases } from "../../quail/prompts.js";
 const QUAIL_ASCII = ["   ,", "  (')>", "/(V)", " ^ ^"];
 class QuailHeader extends Text {
     title;
@@ -41,17 +42,17 @@ class QuailDatasetAutocompleteProvider {
     async getSuggestions(lines, cursorLine, cursorCol, options) {
         const line = lines[cursorLine] ?? "";
         const beforeCursor = line.slice(0, cursorCol);
-        const match = beforeCursor.match(/@\"([^\"\n]*)$/) ?? beforeCursor.match(/@([^\s\"\n]*)$/);
-        if (match) {
-            const query = match[1] ?? "";
-            const prefix = match[0];
+        const mention = getDatasetMentionCompletion(beforeCursor);
+        if (mention) {
+            const { query, prefix } = mention;
             const datasets = listDatasets(this.getCwd()).map((dataset) => ({
-                value: prefix.startsWith("@\"") ? `@\"${dataset.name}\"` : `@${dataset.name}`,
+                value: `@\"${dataset.name}\"`,
                 label: dataset.name,
-                description: `${dataset.entryCount} entries`,
+                description: formatDatasetDescription(dataset.entryCount, getDatasetMentionAliases(dataset)),
                 insertText: `@\"${dataset.name}\"`,
+                aliases: getDatasetMentionAliases(dataset),
             }));
-            const items = query ? fuzzyFilter(datasets, query, (item) => `${item.label} ${item.description ?? ""}`) : datasets;
+            const items = query ? fuzzyFilter(datasets, query, (item) => `${item.label} ${item.description ?? ""} ${item.aliases.join(" ")}`) : datasets;
             return items.length > 0 ? { items, prefix } : null;
         }
         return this.delegate.getSuggestions(lines, cursorLine, cursorCol, options);
@@ -71,6 +72,30 @@ class QuailDatasetAutocompleteProvider {
         }
         return this.delegate.applyCompletion(lines, cursorLine, cursorCol, item, prefix);
     }
+}
+function getDatasetMentionCompletion(beforeCursor) {
+    const quoted = beforeCursor.match(/@\s*"([^"\n]*)$/);
+    if (quoted)
+        return { prefix: quoted[0], query: quoted[1] ?? "" };
+    const atIndex = beforeCursor.lastIndexOf("@");
+    if (atIndex < 0)
+        return undefined;
+    const previous = atIndex > 0 ? beforeCursor[atIndex - 1] : "";
+    if (/[A-Za-z0-9._%+-]/.test(previous))
+        return undefined;
+    const prefix = beforeCursor.slice(atIndex);
+    if (prefix.includes("\"") || prefix.includes("\n"))
+        return undefined;
+    return { prefix, query: prefix.slice(1).trimStart() };
+}
+function formatDatasetDescription(entryCount, aliases) {
+    const brightAliases = aliases
+        .filter((alias) => alias.startsWith("bright "))
+        .slice(0, 2)
+        .map((alias) => `@${alias}`);
+    return brightAliases.length > 0
+        ? `${entryCount} entries · ${brightAliases.join(", ")}`
+        : `${entryCount} entries`;
 }
 function getStartupContent(options) {
     return {

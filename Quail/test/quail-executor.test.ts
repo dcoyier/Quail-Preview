@@ -77,7 +77,7 @@ describe("Quail DSL executor server", () => {
 				state: createEmptyAnalysisState(),
 				blocks: [{
 					datasets: ["Executor Check"],
-					code: 'print(count(all))\nprint(count(temp(contains: ["text": "apple"])))',
+					code: 'print(count(G0))\nprint(count(temp(contains: ["text": "apple"])))',
 					raw: "",
 				}],
 			}),
@@ -95,6 +95,49 @@ describe("Quail DSL executor server", () => {
 		const clear = await request("/cache/clear", { method: "POST" });
 		expect(clear.status).toBe(200);
 		expect(clear.body.ok).toBe(true);
+	});
+
+	it("serializes concurrent executions while sharing optimized runtime caches", async () => {
+		const clear = await request("/cache/clear", { method: "POST" });
+		expect(clear.status).toBe(200);
+
+		const body = JSON.stringify({
+			version: 1,
+			cwd,
+			state: createEmptyAnalysisState(),
+			blocks: [{
+				datasets: ["Executor Check"],
+				code: [
+					`for threshold in [0.0, 0.0]:`,
+					`    print(count(entries of (scope: G0, ([text] BM25 similarity to "apple" > threshold))))`,
+				].join("\n"),
+				raw: "",
+			}],
+		});
+
+		const [first, second] = await Promise.all([
+			request("/quail/execute", { method: "POST", headers: { "content-type": "application/json" }, body }),
+			request("/quail/execute", { method: "POST", headers: { "content-type": "application/json" }, body }),
+		]);
+		expect(first.status).toBe(200);
+		expect(second.status).toBe(200);
+		expect((first.body.result as { output: string }).output.trim().split("\n")).toEqual(["1", "1"]);
+		expect((second.body.result as { output: string }).output.trim().split("\n")).toEqual(["1", "1"]);
+
+		const status = await request("/status");
+		const recent = status.body.recent as Array<{ status: string; startedAt: number; completedAt: number; errors: number }>;
+		expect(recent).toHaveLength(2);
+		expect(recent).toEqual([
+			expect.objectContaining({ status: "completed", errors: 0 }),
+			expect.objectContaining({ status: "completed", errors: 0 }),
+		]);
+		expect(recent[1].startedAt).toBeGreaterThanOrEqual(recent[0].completedAt);
+
+		const cache = status.body.cache as { scoreVectorMisses: number; scoreVectorHits: number; thresholdIdSetMisses: number; thresholdIdSetHits: number };
+		expect(cache.scoreVectorMisses).toBe(1);
+		expect(cache.scoreVectorHits).toBeGreaterThan(0);
+		expect(cache.thresholdIdSetMisses).toBe(1);
+		expect(cache.thresholdIdSetHits).toBeGreaterThan(0);
 	});
 
 	it("returns structured 4xx errors for invalid requests", async () => {

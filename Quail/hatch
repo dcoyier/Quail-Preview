@@ -1,6 +1,15 @@
 #!/usr/bin/env sh
 set -eu
 DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if [ -f "$DIR/../openrouter.env" ]; then
+  set -a
+  . "$DIR/../openrouter.env"
+  set +a
+elif [ -f "$DIR/openrouter.env" ]; then
+  set -a
+  . "$DIR/openrouter.env"
+  set +a
+fi
 if [ ! -f "$DIR/dist/cli.js" ]; then
   npm --prefix "$DIR" run build >/dev/null
 fi

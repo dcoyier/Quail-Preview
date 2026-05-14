@@ -16,7 +16,7 @@ Quail DSL:
 
 The DSL has two main commands that can serve many different purposes:
 
-1. retrieve(DIRECTION AMOUNT UNIT.REGEX out of GROUP-EXPR sorted by RANKING)
+1. retrieve(DIRECTION AMOUNT UNIT.REGEX of GROUP-EXPR sorted by RANKING)
     - Returns the top k units out of set of units that have been ranked a certain way
 2. count(UNIT of GROUP-EXPR)
     - Returns the count of units in a group expression
@@ -58,7 +58,7 @@ G-CLAUSE = ([FIELD].REGEX FUNCTION CONDITION)
 - Note that .REGEX is not required
 
 FUNCTION
-- options: 
+- options:
   - with only a single element being compared:
     1. ACCUMULATION-INPUT MODE similarity to " "
     2. ACCUMULATION-INPUT per ACCUMULATION-TEST MODE similarity to [" ", " "]
@@ -103,12 +103,21 @@ Note: make sure to use parentheses in the designated places. Quotation marks aro
 
 End two command overview.
 
-You can combine the core primitives used within these two commands separate from the commands themselves (e.g. a GROUP can be created as just a set that can be utilized in some particular way) in your DSL execution. In a quail tool call, these commands should be woven through a code substrate: use variables, lists, loops, conditionals, etc. as you wish to fluidly compose a code execution. This code consists of all core Python and no external libraries. You are unable to import anything. Primarily, you should use fundamental coding syntax to help prepare, combine, and store data for commands. Variables persist across DSL executions.
+You can combine the core primitives used within these two commands separate from the commands themselves (e.g. a GROUP can be created as just a set that can be utilized in some particular way) in your DSL execution. In a quail tool call, these commands should be woven through a code substrate: use variables, lists, loops, conditionals, etc. as you wish to fluidly compose a code execution. This code consists of all core Python and no external libraries. You are unable to import anything. When using Python, you should use fundamental tge coding syntax to help prepare, combine, and store data for the two primary commands. Python should not be the analysis engine itself. Python bindings persist across DSL executions. To save variables, use save(variable). Use g_save to save groups.
 
 You also have a few other commands available, specific to Quail:
 
 print( ... )
 - only what is within print( ... ) will be returned in the results of the quail tool call, besides:
+
+get(ITEM)
+- retrieve Quail metadata/source objects. get(id) returns one entry object with .fields, and [FIELD].tag
+
+save(VARIABLE)
+- persist a JSON-like variable across DSL executions. save(counter) saves the current variable named counter; ordinary variables that are not saved do not persist. Use g_save(GROUP-EXPR) for groups instead
+
+group_expr(GROUP-EXPR)
+- create an unsaved first-class group expression value. You can store group expression values in Python lists, tuples, and dictionaries, then pass them through loop variables into count(...) and retrieve(...). Bare scoped group literals such as (scope: G0, ([year] == 2024)) also work as group expression values in Python containers and function calls. In a scoped group, scope: may be G0, G1, a saved group id, or a group variable
 
 g_save(GROUP-EXPR)
 - save a group to be used later. Use this to save tokens! Substituting g_save(GROUP) for a GROUP is the standard usage. This command will print a group ID, G#, that you can plug in for future commands. This is the only command that automatically prints something. Saved groups through g_save(), or even automatically saved groups, G0 and G1, can be completed substituted completely as a GROUP
