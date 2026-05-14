@@ -6,11 +6,12 @@
  * Test with: npx tsx src/cli-new.ts [args...]
  */
 import { EnvHttpProxyAgent, setGlobalDispatcher } from "undici";
+import { currentApp } from "./apps/current.js";
 import { APP_NAME } from "./config.js";
 import { main } from "./main.js";
 process.title = APP_NAME;
 process.env.PI_CODING_AGENT = "true";
-process.env.QUAIL_CODING_AGENT = APP_NAME === "quail" ? "true" : process.env.QUAIL_CODING_AGENT;
+currentApp.configureProcessEnvironment?.();
 process.emitWarning = (() => { });
 setGlobalDispatcher(new EnvHttpProxyAgent());
 main(process.argv.slice(2));

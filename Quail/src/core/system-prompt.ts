@@ -2,8 +2,8 @@
  * System prompt construction and project context loading
  */
 
-import { APP_NAME, getDocsPath, getExamplesPath, getReadmePath } from "../config.js";
-import { buildQuailMainSystemPrompt, type ActiveDatasetInfo } from "../quail/prompts.js";
+import { currentApp } from "../apps/current.js";
+import { getDocsPath, getExamplesPath, getReadmePath } from "../config.js";
 import { formatSkillsForPrompt, type Skill } from "./skills.js";
 
 export interface BuildSystemPromptOptions {
@@ -24,7 +24,7 @@ export interface BuildSystemPromptOptions {
 	/** Pre-loaded skills. */
 	skills?: Skill[];
 	/** Quail dataset activation context for the qualitative-analysis prompt. */
-	quailActiveDatasets?: ActiveDatasetInfo[];
+	quailActiveDatasets?: unknown[];
 }
 
 /** Build the system prompt with tools, guidelines, and context */
@@ -54,18 +54,14 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 	const contextFiles = providedContextFiles ?? [];
 	const skills = providedSkills ?? [];
 
-	if (APP_NAME === "quail" && !customPrompt) {
-		let prompt = buildQuailMainSystemPrompt({ activeDatasets: quailActiveDatasets });
-		if (appendSection) {
-			prompt += appendSection;
-		}
-		if (contextFiles.length > 0) {
-			prompt += "\n\n# Project Context\n\n";
-			for (const { path: filePath, content } of contextFiles) {
-				prompt += `## ${filePath}\n\n${content}\n\n`;
-			}
-		}
-		return prompt;
+	const appPrompt = currentApp.buildSystemPromptOverride?.({
+		customPrompt,
+		appendSection,
+		contextFiles,
+		quailActiveDatasets,
+	});
+	if (appPrompt) {
+		return appPrompt;
 	}
 
 	if (customPrompt) {
@@ -91,7 +87,7 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 		}
 
 		// Add date and working directory last for the generic coding-agent prompt.
-		if (APP_NAME !== "quail") {
+		if (currentApp.appendDateToCustomPrompt !== false) {
 			prompt += `\nCurrent date: ${date}`;
 			prompt += `\nCurrent working directory: ${promptCwd}`;
 		}

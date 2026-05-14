@@ -4,6 +4,7 @@
 
 import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
 import chalk from "chalk";
+import { currentApp } from "../apps/current.js";
 import { APP_NAME, CONFIG_DIR_NAME, ENV_AGENT_DIR } from "../config.js";
 import type { ExtensionFlag } from "../core/extensions/types.js";
 
@@ -194,10 +195,13 @@ export function printHelp(extensionFlags?: ExtensionFlag[]): void {
 					})
 					.join("\n")}\n`
 			: "";
-	const appDescription =
-		APP_NAME === "quail"
-			? "qualitative analysis harness with processed corpus search"
-			: "AI coding assistant with read, bash, edit, write tools";
+	const appDescription = currentApp.description;
+	const appCommands =
+		currentApp.cliHelpCommands && currentApp.cliHelpCommands.length > 0
+			? `${currentApp.cliHelpCommands
+					.map((command) => `  ${APP_NAME} ${command.usage}`.padEnd(34) + command.description)
+					.join("\n")}\n`
+			: "";
 	console.log(`${chalk.bold(APP_NAME)} - ${appDescription}
 
 ${chalk.bold("Usage:")}
@@ -210,7 +214,7 @@ ${chalk.bold("Commands:")}
   ${APP_NAME} update [source]           Update installed extensions (skips pinned sources)
   ${APP_NAME} list                      List installed extensions from settings
   ${APP_NAME} config                    Open TUI to enable/disable package resources
-  ${APP_NAME} executor start            Start a warm Quail DSL executor server
+${appCommands.trimEnd()}
   ${APP_NAME} <command> --help          Show help for install/remove/uninstall/update/list
 
 ${chalk.bold("Options:")}

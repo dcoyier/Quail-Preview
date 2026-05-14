@@ -2,101 +2,62 @@ import { describe, expect, test } from "vitest";
 import { buildSystemPrompt } from "../src/core/system-prompt.js";
 
 describe("buildSystemPrompt", () => {
-	describe("empty tools", () => {
-		test("shows (none) for empty tools list", () => {
-			const prompt = buildSystemPrompt({
-				selectedTools: [],
-				contextFiles: [],
-				skills: [],
-				cwd: process.cwd(),
-			});
-
-			expect(prompt).toContain("Available tools:\n(none)");
+	test("uses Quail's DSL system prompt by default", () => {
+		const prompt = buildSystemPrompt({
+			selectedTools: [],
+			contextFiles: [],
+			skills: [],
+			cwd: process.cwd(),
 		});
 
-		test("shows file paths guideline even with no tools", () => {
-			const prompt = buildSystemPrompt({
-				selectedTools: [],
-				contextFiles: [],
-				skills: [],
-				cwd: process.cwd(),
-			});
-
-			expect(prompt).toContain("Show file paths clearly");
-		});
+		expect(prompt).toContain("You are an agent in a qualitative research harness.");
+		expect(prompt).toContain("Quail DSL:");
+		expect(prompt).toContain("The user has activated the following dataset(s)");
+		expect(prompt).toContain("- (none)");
+		expect(prompt).not.toContain("Available tools:");
+		expect(prompt).not.toContain("Current working directory:");
 	});
 
-	describe("default tools", () => {
-		test("includes all default tools when snippets are provided", () => {
-			const prompt = buildSystemPrompt({
-				toolSnippets: {
-					read: "Read file contents",
-					bash: "Execute bash commands",
-					edit: "Make surgical edits",
-					write: "Create or overwrite files",
-				},
-				contextFiles: [],
-				skills: [],
-				cwd: process.cwd(),
-			});
-
-			expect(prompt).toContain("- read:");
-			expect(prompt).toContain("- bash:");
-			expect(prompt).toContain("- edit:");
-			expect(prompt).toContain("- write:");
+	test("includes active dataset context in the Quail prompt", () => {
+		const prompt = buildSystemPrompt({
+			selectedTools: ["quail"],
+			contextFiles: [],
+			skills: [],
+			cwd: process.cwd(),
+			quailActiveDatasets: [{ name: "ASRS Primary Problem Narratives Tagged", entries: 231209 }],
 		});
+
+		expect(prompt).toContain('- "ASRS Primary Problem Narratives Tagged", 231209');
 	});
 
-	describe("custom tool snippets", () => {
-		test("includes custom tools in available tools section when promptSnippet is provided", () => {
-			const prompt = buildSystemPrompt({
-				selectedTools: ["read", "dynamic_tool"],
-				toolSnippets: {
-					dynamic_tool: "Run dynamic test behavior",
-				},
-				contextFiles: [],
-				skills: [],
-				cwd: process.cwd(),
-			});
-
-			expect(prompt).toContain("- dynamic_tool: Run dynamic test behavior");
+	test("appends project context and explicit append text to the Quail prompt", () => {
+		const prompt = buildSystemPrompt({
+			selectedTools: ["quail"],
+			contextFiles: [{ path: "/tmp/project/AGENTS.md", content: "Prefer compact evidence summaries." }],
+			skills: [],
+			cwd: process.cwd(),
+			appendSystemPrompt: "Additional Quail instruction.",
 		});
 
-		test("omits custom tools from available tools section when promptSnippet is not provided", () => {
-			const prompt = buildSystemPrompt({
-				selectedTools: ["read", "dynamic_tool"],
-				contextFiles: [],
-				skills: [],
-				cwd: process.cwd(),
-			});
-
-			expect(prompt).not.toContain("dynamic_tool");
-		});
+		expect(prompt).toContain("Additional Quail instruction.");
+		expect(prompt).toContain("# Project Context");
+		expect(prompt).toContain("## /tmp/project/AGENTS.md");
+		expect(prompt).toContain("Prefer compact evidence summaries.");
 	});
 
-	describe("prompt guidelines", () => {
-		test("appends promptGuidelines to default guidelines", () => {
-			const prompt = buildSystemPrompt({
-				selectedTools: ["read", "dynamic_tool"],
-				promptGuidelines: ["Use dynamic_tool for project summaries."],
-				contextFiles: [],
-				skills: [],
-				cwd: process.cwd(),
-			});
-
-			expect(prompt).toContain("- Use dynamic_tool for project summaries.");
+	test("lets an explicit custom prompt bypass the Quail DSL prompt", () => {
+		const prompt = buildSystemPrompt({
+			customPrompt: "Custom research harness prompt.",
+			selectedTools: ["quail"],
+			contextFiles: [],
+			skills: [],
+			cwd: "/tmp/quail-project",
+			appendSystemPrompt: "Extra instruction.",
 		});
 
-		test("deduplicates and trims promptGuidelines", () => {
-			const prompt = buildSystemPrompt({
-				selectedTools: ["read", "dynamic_tool"],
-				promptGuidelines: ["Use dynamic_tool for summaries.", "  Use dynamic_tool for summaries.  ", "   "],
-				contextFiles: [],
-				skills: [],
-				cwd: process.cwd(),
-			});
-
-			expect(prompt.match(/- Use dynamic_tool for summaries\./g)).toHaveLength(1);
-		});
+		expect(prompt).toContain("Custom research harness prompt.");
+		expect(prompt).toContain("Extra instruction.");
+		expect(prompt).not.toContain("Quail DSL:");
+		expect(prompt).not.toContain("Current working directory:");
 	});
 });

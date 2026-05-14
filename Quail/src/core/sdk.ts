@@ -1,7 +1,8 @@
 import { join } from "node:path";
 import { Agent, type AgentMessage, type ThinkingLevel } from "@mariozechner/pi-agent-core";
 import { type Message, type Model, streamSimple } from "@mariozechner/pi-ai";
-import { APP_NAME, getAgentDir, getDocsPath } from "../config.js";
+import { currentApp } from "../apps/current.js";
+import { getAgentDir, getDocsPath } from "../config.js";
 import { AgentSession } from "./agent-session.js";
 import { AuthStorage } from "./auth-storage.js";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js";
@@ -15,7 +16,6 @@ import { getDefaultSessionDir, SessionManager } from "./session-manager.js";
 import { SettingsManager } from "./settings-manager.js";
 import { isInstallTelemetryEnabled } from "./telemetry.js";
 import { time } from "./timings.js";
-import { createQuailQueryToolDefinition } from "../quail/query-tool.js";
 import {
 	createBashTool,
 	createCodingTools,
@@ -254,20 +254,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	}
 
 	const defaultActiveToolNames: string[] =
-		APP_NAME === "quail" ? ["quail"] : (["read", "bash", "edit", "write"] satisfies ToolName[]);
+		currentApp.defaultActiveToolNames?.slice() ?? (["read", "bash", "edit", "write"] satisfies ToolName[]);
 	const allowedToolNames = options.tools ?? (options.noTools === "all" ? [] : undefined);
 	const initialActiveToolNames: string[] = options.tools
 		? [...options.tools]
 		: options.noTools
 			? []
 			: defaultActiveToolNames;
+	const appTools = currentApp.createToolDefinitions?.({ cwd, sessionManager }) ?? [];
 	const customTools: ToolDefinition[] | undefined =
-		APP_NAME === "quail"
-			? [
-					...(options.customTools ?? []),
-					createQuailQueryToolDefinition(cwd, sessionManager) as unknown as ToolDefinition,
-				]
-			: options.customTools;
+		options.customTools || appTools.length > 0 ? [...(options.customTools ?? []), ...appTools] : undefined;
 
 	let agent: Agent;
 

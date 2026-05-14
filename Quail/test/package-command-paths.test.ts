@@ -2,7 +2,7 @@ import { mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ENV_AGENT_DIR } from "../src/config.js";
+import { CONFIG_DIR_NAME, ENV_AGENT_DIR } from "../src/config.js";
 import { main } from "../src/main.js";
 
 describe("package commands", () => {
@@ -15,7 +15,7 @@ describe("package commands", () => {
 	let originalExitCode: typeof process.exitCode;
 
 	beforeEach(() => {
-		tempDir = join(tmpdir(), `pi-package-commands-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		tempDir = join(tmpdir(), `quail-package-commands-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		agentDir = join(tempDir, "agent");
 		projectDir = join(tempDir, "project");
 		packageDir = join(tempDir, "local-package");
@@ -69,6 +69,17 @@ describe("package commands", () => {
 		expect(removedSettings.packages ?? []).toHaveLength(0);
 	});
 
+	it("should persist project-local packages in the Quail project config directory", async () => {
+		await main(["install", `${packageDir}/`, "--local"]);
+
+		const globalSettingsPath = join(agentDir, "settings.json");
+		const projectSettingsPath = join(projectDir, CONFIG_DIR_NAME, "settings.json");
+		const projectSettings = JSON.parse(readFileSync(projectSettingsPath, "utf-8")) as { packages?: string[] };
+		expect(projectSettings.packages?.length).toBe(1);
+		expect(realpathSync(join(projectDir, CONFIG_DIR_NAME, projectSettings.packages?.[0] ?? ""))).toBe(realpathSync(packageDir));
+		expect(() => readFileSync(globalSettingsPath, "utf-8")).toThrow();
+	});
+
 	it("shows install subcommand help", async () => {
 		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -78,7 +89,7 @@ describe("package commands", () => {
 
 			const stdout = logSpy.mock.calls.map(([message]) => String(message)).join("\n");
 			expect(stdout).toContain("Usage:");
-			expect(stdout).toContain("pi install <source> [-l]");
+			expect(stdout).toContain("quail install <source> [-l]");
 			expect(errorSpy).not.toHaveBeenCalled();
 			expect(process.exitCode).toBeUndefined();
 		} finally {
@@ -95,7 +106,7 @@ describe("package commands", () => {
 
 			const stderr = errorSpy.mock.calls.map(([message]) => String(message)).join("\n");
 			expect(stderr).toContain('Unknown option --unknown for "install".');
-			expect(stderr).toContain('Use "pi --help" or "pi install <source> [-l]".');
+			expect(stderr).toContain('Use "quail --help" or "quail install <source> [-l]".');
 			expect(process.exitCode).toBe(1);
 		} finally {
 			errorSpy.mockRestore();
@@ -110,7 +121,7 @@ describe("package commands", () => {
 
 			const stderr = errorSpy.mock.calls.map(([message]) => String(message)).join("\n");
 			expect(stderr).toContain("Missing install source.");
-			expect(stderr).toContain("Usage: pi install <source> [-l]");
+			expect(stderr).toContain("Usage: quail install <source> [-l]");
 			expect(stderr).not.toContain("at ");
 			expect(process.exitCode).toBe(1);
 		} finally {

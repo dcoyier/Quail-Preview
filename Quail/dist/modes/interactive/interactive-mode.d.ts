@@ -117,7 +117,7 @@ export declare class InteractiveMode {
      * Only shows new entries since last seen version, skips for resumed sessions.
      */
     private getChangelogForDisplay;
-    private isQuailProcessingThread;
+    private isAppProcessingThread;
     private reportInstallTelemetry;
     private getMarkdownThemeWithSettings;
     private formatDisplayPath;

@@ -21,7 +21,14 @@ Options:
   --max-body-bytes <bytes>              Maximum JSON request body size
 
 The executor keeps processed datasets and DSL runtime caches warm across calls.
-Point a Quail session at it with QUAIL_DSL_EXECUTOR_URL=http://host:port.`);
+Point a Quail session at it with QUAIL_DSL_EXECUTOR_URL=http://host:port.
+
+HTTP endpoints:
+  GET  /health
+  GET  /status
+  POST /cache/clear
+  POST /quail/prewarm
+  POST /quail/execute`);
 }
 
 function parseExecutorArgs(args: string[]): ExecutorCliArgs {

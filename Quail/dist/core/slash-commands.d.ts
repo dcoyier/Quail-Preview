@@ -11,4 +11,4 @@ export interface BuiltinSlashCommand {
     description: string;
     processThreadOnly?: boolean;
 }
-export declare const BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand>;
+export declare function getBuiltinSlashCommands(): ReadonlyArray<BuiltinSlashCommand>;

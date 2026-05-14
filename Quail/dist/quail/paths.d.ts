@@ -1,6 +1,8 @@
 export declare const QUAIL_WORKSPACE_DIR = "workspace";
 export declare const QUAIL_DATASETS_DIR = "datasets";
 export declare const QUAIL_STAGING_DIR = "staging";
+export declare const QUAIL_WORKSPACE_PATH_ENV = "QUAIL_WORKSPACE_PATH";
+export declare const QUAIL_WORKSPACE_SCOPE_ENV = "QUAIL_WORKSPACE_SCOPE";
 export declare function getQuailWorkspaceDir(cwd: string): string;
 export declare function getQuailDatasetsDir(cwd: string): string;
 export declare function getQuailStagingDir(cwd: string): string;

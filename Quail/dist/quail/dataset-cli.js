@@ -1,7 +1,7 @@
 import { existsSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import chalk from "chalk";
-import { ensureQuailWorkspace, getQuailStagingDir } from "./paths.js";
+import { ensureQuailWorkspace, getQuailDatasetsDir, getQuailStagingDir } from "./paths.js";
 import { datasetExists, inspectDatasetFile, listDatasets, processDataset, removeDataset } from "./dataset-store.js";
 function printDatasetHelp() {
     console.log(`Quail dataset commands
@@ -163,7 +163,7 @@ export async function handleDatasetCommand(args, cwd = process.cwd()) {
             case "list": {
                 const datasets = listDatasets(cwd);
                 if (datasets.length === 0) {
-                    console.log("No processed datasets in workspace/datasets yet.");
+                    console.log(`No processed datasets in ${getQuailDatasetsDir(cwd)} yet.`);
                     return true;
                 }
                 for (const item of datasets) {

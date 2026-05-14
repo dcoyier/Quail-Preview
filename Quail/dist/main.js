@@ -14,6 +14,7 @@ import { processFileArguments } from "./cli/file-processor.js";
 import { buildInitialMessage } from "./cli/initial-message.js";
 import { listModels } from "./cli/list-models.js";
 import { selectSession } from "./cli/session-picker.js";
+import { currentApp } from "./apps/current.js";
 import { getAgentDir, getModelsPath, VERSION } from "./config.js";
 import { createAgentSessionRuntime } from "./core/agent-session-runtime.js";
 import { createAgentSessionFromServices, createAgentSessionServices, } from "./core/agent-session-services.js";
@@ -31,7 +32,6 @@ import { InteractiveMode, runPrintMode, runRpcMode } from "./modes/index.js";
 import { ExtensionSelectorComponent } from "./modes/interactive/components/extension-selector.js";
 import { initTheme, stopThemeWatcher } from "./modes/interactive/theme/theme.js";
 import { handleConfigCommand, handlePackageCommand } from "./package-manager-cli.js";
-import { handleDatasetCommand, handleExecutorCommand } from "./quail/index.js";
 import { isLocalPath } from "./utils/paths.js";
 /**
  * Read all content from piped stdin.
@@ -330,10 +330,7 @@ export async function main(args, options) {
     if (await handleConfigCommand(args)) {
         return;
     }
-    if (await handleDatasetCommand(args)) {
-        return;
-    }
-    if (await handleExecutorCommand(args)) {
+    if (await currentApp.handleCliCommand?.(args)) {
         return;
     }
     const parsed = parseArgs(args);

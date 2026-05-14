@@ -1,11 +1,12 @@
 import { request } from "undici";
 import {
 	bm25ScoreTerms,
-	cosineSimilarity,
 	embedTexts,
 	fieldDocumentId,
 	fieldValueToText,
 	loadDatasets,
+	scoreEmbeddingVectorValues,
+	type EmbeddingVector,
 	type FieldValue,
 	type LoadedQuailDataset,
 	type QuailEntry,
@@ -48,7 +49,7 @@ interface RuntimeContext {
 	tagMutations: TagMutation[];
 	bm25QueryTerms: Map<string, string[]>;
 	embeddingQueryVectors: Map<string, ArrayLike<number>>;
-	groupExpressionCache: Map<string, Set<string>>;
+	groupExpressionCache: Map<string, IdBitSet>;
 	runtimeCache: DslRuntimeCache;
 }
 
@@ -57,9 +58,9 @@ type TagValue = string | string[];
 
 interface DslRuntimeCache {
 	scoreVectors: LruMap<string, Float32Array>;
-	thresholdIdSets: LruMap<string, Set<string>>;
-	fieldComparisonIdSets: LruMap<string, Set<string>>;
-	textFilterIdSets: LruMap<string, Set<string>>;
+	thresholdIdSets: LruMap<string, IdBitSet>;
+	fieldComparisonIdSets: LruMap<string, IdBitSet>;
+	textFilterIdSets: LruMap<string, IdBitSet>;
 	queryEmbeddings: LruMap<string, ArrayLike<number>>;
 	stats: DslRuntimeCacheStats;
 }
@@ -176,6 +177,132 @@ class LruMap<K, V> {
 	}
 }
 
+class IdBitSet {
+	readonly words: Uint32Array;
+	readonly size: number;
+
+	private constructor(
+		readonly length: number,
+		words?: Uint32Array,
+		size?: number,
+	) {
+		this.words = words ?? new Uint32Array(Math.ceil(length / 32));
+		this.size = size ?? countWords(this.words);
+	}
+
+	static empty(length: number): IdBitSet {
+		return new IdBitSet(length, undefined, 0);
+	}
+
+	static full(length: number): IdBitSet {
+		const words = new Uint32Array(Math.ceil(length / 32));
+		words.fill(0xffffffff);
+		maskUnusedBits(words, length);
+		return new IdBitSet(length, words, length);
+	}
+
+	static fromIds(ids: Iterable<string>, ctx: RuntimeContext): IdBitSet {
+		const out = IdBitSet.empty(ctx.entries.length);
+		for (const id of ids) out.addId(id, ctx);
+		return out;
+	}
+
+	static fromPredicate(ctx: RuntimeContext, predicate: (entry: QuailEntry, index: number) => boolean): IdBitSet {
+		const out = IdBitSet.empty(ctx.entries.length);
+		for (const [index, entry] of ctx.entries.entries()) {
+			if (predicate(entry, index)) out.addIndex(index);
+		}
+		return out;
+	}
+
+	clone(): IdBitSet {
+		return new IdBitSet(this.length, this.words.slice(), this.size);
+	}
+
+	addIndex(index: number): void {
+		if (index < 0 || index >= this.length) return;
+		const wordIndex = index >>> 5;
+		const mask = 1 << (index & 31);
+		if ((this.words[wordIndex] & mask) !== 0) return;
+		this.words[wordIndex] |= mask;
+		(this as { size: number }).size++;
+	}
+
+	deleteIndex(index: number): void {
+		if (index < 0 || index >= this.length) return;
+		const wordIndex = index >>> 5;
+		const mask = 1 << (index & 31);
+		if ((this.words[wordIndex] & mask) === 0) return;
+		this.words[wordIndex] &= ~mask;
+		(this as { size: number }).size--;
+	}
+
+	addId(id: string, ctx: RuntimeContext): void {
+		const index = ctx.entryIndexById.get(id);
+		if (index !== undefined) this.addIndex(index);
+	}
+
+	deleteId(id: string, ctx: RuntimeContext): void {
+		const index = ctx.entryIndexById.get(id);
+		if (index !== undefined) this.deleteIndex(index);
+	}
+
+	hasIndex(index: number): boolean {
+		return index >= 0 && index < this.length && (this.words[index >>> 5] & (1 << (index & 31))) !== 0;
+	}
+
+	and(other: IdBitSet): IdBitSet {
+		const words = new Uint32Array(this.words.length);
+		for (let i = 0; i < words.length; i++) words[i] = this.words[i] & other.words[i];
+		return new IdBitSet(this.length, words);
+	}
+
+	or(other: IdBitSet): IdBitSet {
+		const words = new Uint32Array(this.words.length);
+		for (let i = 0; i < words.length; i++) words[i] = this.words[i] | other.words[i];
+		return new IdBitSet(this.length, words);
+	}
+
+	not(): IdBitSet {
+		const words = new Uint32Array(this.words.length);
+		for (let i = 0; i < words.length; i++) words[i] = ~this.words[i];
+		maskUnusedBits(words, this.length);
+		return new IdBitSet(this.length, words);
+	}
+
+	toIds(ctx: RuntimeContext): string[] {
+		const ids: string[] = [];
+		for (let index = 0; index < this.length; index++) {
+			if (this.hasIndex(index)) ids.push(ctx.entries[index].id);
+		}
+		return ids;
+	}
+
+	toIdSet(ctx: RuntimeContext): Set<string> {
+		return new Set(this.toIds(ctx));
+	}
+}
+
+function maskUnusedBits(words: Uint32Array, length: number): void {
+	if (words.length === 0) return;
+	const usedBits = length & 31;
+	if (usedBits === 0) return;
+	words[words.length - 1] &= 0xffffffff >>> (32 - usedBits);
+}
+
+function countWords(words: Uint32Array): number {
+	let count = 0;
+	for (const word of words) count += popcount32(word);
+	return count;
+}
+
+function popcount32(value: number): number {
+	value >>>= 0;
+	value -= (value >>> 1) & 0x55555555;
+	value = (value & 0x33333333) + ((value >>> 2) & 0x33333333);
+	return (((value + (value >>> 4)) & 0x0f0f0f0f) * 0x01010101) >>> 24;
+}
+
 const runtimeCaches = new Map<string, DslRuntimeCache>();
 
 function envPositiveInt(name: string, fallback: number): number {
@@ -220,9 +347,10 @@ function createRuntimeCache(): DslRuntimeCache {
 function getRuntimeCache(cwd: string, datasets: LoadedQuailDataset[]): DslRuntimeCache {
 	const key = [
 		cwd,
-		...datasets.map((dataset) => [
-			dataset.manifest.slug,
-			dataset.manifest.updatedAt,
+			...datasets.map((dataset) => [
+				dataset.datasetDir,
+				dataset.manifest.slug,
+				dataset.manifest.updatedAt,
 			dataset.manifest.entryCount,
 			dataset.manifest.embeddingModel,
 			dataset.manifest.embeddingDimensions,
@@ -679,7 +807,7 @@ async function resolveTagTargetIds(targetText: string, ctx: RuntimeContext, line
 	const target = resolveBareOrString(targetText, ctx);
 	if (typeof target === "string" && ctx.entriesById.has(target)) return [target];
 	const expression = isGroupExpressionValue(target) ? target.expression : String(target);
-	return [...await resolveGroupExpression(expression, ctx, line)];
+	return (await resolveGroupExpression(expression, ctx, line)).toIds(ctx);
 }
 
 async function executeUntag(text: string, ctx: RuntimeContext, line: number): Promise<void> {
@@ -1203,20 +1331,29 @@ function getTagIndex(ctx: RuntimeContext): TagIndex {
 }
 
 function getIdsMatchingTags(tags: Record<string, string>, ctx: RuntimeContext): Set<string> {
+	return getIdsMatchingTagsBits(tags, ctx).toIdSet(ctx);
+}
+
+function getIdsMatchingTagsBits(tags: Record<string, string>, ctx: RuntimeContext): IdBitSet {
 	const index = getTagIndex(ctx);
-	let ids: Set<string> | undefined;
+	let ids: IdBitSet | undefined;
 	for (const [field, value] of Object.entries(tags)) {
 		const matching = index.get(field)?.get(value);
-		if (!matching) return new Set();
-		ids = ids ? intersectSets(ids, matching) : new Set(matching);
+		if (!matching) return IdBitSet.empty(ctx.entries.length);
+		const matchingBits = IdBitSet.fromIds(matching, ctx);
+		ids = ids ? ids.and(matchingBits) : matchingBits;
 		if (ids.size === 0) return ids;
 	}
-	return ids ?? new Set(ctx.entries.map((entry) => entry.id));
+	return ids ?? IdBitSet.full(ctx.entries.length);
 }
 
 function intersectSets(a: Set<string>, b: Set<string>): Set<string> {
 	const [small, large] = a.size <= b.size ? [a, b] : [b, a];
-	return new Set([...small].filter((id) => large.has(id)));
+	const out = new Set<string>();
+	for (const id of small) {
+		if (large.has(id)) out.add(id);
+	}
+	return out;
 }
 
 async function countGroup(arg: string, ctx: RuntimeContext, line: number): Promise<number> {
@@ -1231,7 +1368,7 @@ async function countBy(arg: string, ctx: RuntimeContext, line: number): Promise<
 		throw new DslRuntimeError("E_PARSE_COUNT_BY", "count_by requires a non-empty list of fields", line);
 	}
 	const fields = fieldValues.map(String);
-	const ids = [...(await resolveGroupExpression(parts[2], ctx, line))];
+	const ids = (await resolveGroupExpression(parts[2], ctx, line)).toIds(ctx);
 	const buckets = new Map<string, { values: Array<FieldValue | string>; count: number }>();
 	for (const id of ids) {
 		const entry = ctx.entriesById.get(id);
@@ -1286,6 +1423,10 @@ function uniqueFieldValues(values: Array<FieldValue | string>): Array<FieldValue
 }
 
 async function resolveGroupSpec(specText: string, ctx: RuntimeContext, line: number): Promise<Set<string>> {
+	return (await resolveGroupSpecBits(specText, ctx, line)).toIdSet(ctx);
+}
+
+async function resolveGroupSpecBits(specText: string, ctx: RuntimeContext, line: number): Promise<IdBitSet> {
 	const spec = await parseGroupSpec(specText, ctx, line);
 	const hasConstraints = spec.fieldsCompare.length > 0 ||
 		Boolean(spec.tags) ||
@@ -1293,25 +1434,26 @@ async function resolveGroupSpec(specText: string, ctx: RuntimeContext, line: num
 		spec.containsWord.length > 0 ||
 		spec.bm25.length > 0 ||
 		spec.embeddings.length > 0;
-	let ids = !hasConstraints && spec.include ? new Set<string>() : new Set(ctx.entries.map((entry) => entry.id));
+	let ids = !hasConstraints && spec.include ? IdBitSet.empty(ctx.entries.length) : IdBitSet.full(ctx.entries.length);
 	if (spec.fieldsCompare.length > 0) {
 		ids = getIdsComparingFields(spec.fieldsCompare, ctx, line);
 	}
-	if (spec.tags) ids = intersectSets(ids, getIdsMatchingTags(spec.tags, ctx));
+	if (spec.tags) ids = ids.and(getIdsMatchingTagsBits(spec.tags, ctx));
 	for (const predicate of spec.contains) {
-		ids = intersectSets(ids, getIdsContaining(predicate, ctx));
+		ids = ids.and(getIdsContaining(predicate, ctx));
 	}
 	for (const predicate of spec.containsWord) {
-		ids = intersectSets(ids, getIdsContainingWord(predicate, ctx, line));
+		ids = ids.and(getIdsContainingWord(predicate, ctx, line));
 	}
 	for (const predicate of spec.bm25) {
-		ids = intersectSets(ids, getIdsAboveBm25Threshold(predicate, predicate.threshold ?? 0, ctx));
+		ids = ids.and(getIdsAboveBm25Threshold(predicate, predicate.threshold ?? 0, ctx));
 	}
 	for (const predicate of spec.embeddings) {
-		ids = intersectSets(ids, await getIdsAboveEmbeddingThreshold(predicate, predicate.threshold ?? 0, ctx, line));
+		ids = ids.and(await getIdsAboveEmbeddingThreshold(predicate, predicate.threshold ?? 0, ctx, line));
 	}
-	for (const id of spec.include ?? []) ids.add(id);
-	for (const id of spec.exclude ?? []) ids.delete(id);
+	if (spec.include || spec.exclude) ids = ids.clone();
+	for (const id of spec.include ?? []) ids.addId(id, ctx);
+	for (const id of spec.exclude ?? []) ids.deleteId(id, ctx);
 	return ids;
 }
 
@@ -1339,7 +1481,7 @@ function createGroupExpression(expression: string): GroupExpressionValue {
 async function retrieve(arg: string, ctx: RuntimeContext, line: number): Promise<string[]> {
 	const parsed = parseRetrieveArgs(arg, line);
 	const amount = parsed.amount;
-	const ids = [...(await resolveGroupExpression(parsed.groupExpression, ctx, line))];
+	const ids = (await resolveGroupExpression(parsed.groupExpression, ctx, line)).toIds(ctx);
 	let selected: string[];
 	if (!parsed.filter) {
 		if (parsed.location === "top") selected = ids.slice(0, amount);
@@ -1625,7 +1767,7 @@ async function parseTagPairs(text: string, ctx: RuntimeContext, line: number): P
 	return tags;
 }
 
-async function resolveGroupExpression(expr: string, ctx: RuntimeContext, line: number): Promise<Set<string>> {
+async function resolveGroupExpression(expr: string, ctx: RuntimeContext, line: number): Promise<IdBitSet> {
 	const text = trimOuterParens(expr.trim());
 	const cacheable = isCacheableGroupExpressionText(text, ctx);
 
@@ -1643,46 +1785,46 @@ async function resolveGroupExpression(expr: string, ctx: RuntimeContext, line: n
 	return result;
 }
 
-async function resolveGroupExpressionUncached(text: string, ctx: RuntimeContext, line: number): Promise<Set<string>> {
-	if (!text || text === "all") return new Set(ctx.entries.map((entry) => entry.id));
+async function resolveGroupExpressionUncached(text: string, ctx: RuntimeContext, line: number): Promise<IdBitSet> {
+	if (!text || text === "all") return IdBitSet.full(ctx.entries.length);
 	if (text in ctx.state.variables) {
 		const value = ctx.state.variables[text];
 		if (isGroupExpressionValue(value)) return resolveGroupExpression(value.expression, ctx, line);
 		if (typeof value === "string") return resolveGroupExpression(value, ctx, line);
 		throw new DslRuntimeError("E_GROUP_EXPR_VARIABLE", `Variable ${text} does not contain a group expression. Use group_expr(<group_expression>) when assigning reusable group expressions.`, line);
 	}
-	if (ctx.state.groups[text]) return new Set(ctx.state.groups[text].entryIds.filter((id) => ctx.entriesById.has(id)));
+	if (ctx.state.groups[text]) return IdBitSet.fromIds(ctx.state.groups[text].entryIds, ctx);
 	const orParts = splitTopLevelByWord(text, "or");
 	if (orParts.length > 1) {
-		const out = new Set<string>();
-		for (const part of orParts) for (const id of await resolveGroupExpression(part, ctx, line)) out.add(id);
+		let out = IdBitSet.empty(ctx.entries.length);
+		for (const part of orParts) out = out.or(await resolveGroupExpression(part, ctx, line));
 		return out;
 	}
 	const andParts = splitTopLevelByWord(text, "and");
 	if (andParts.length > 1) {
-		let out: Set<string> | undefined;
+		let out: IdBitSet | undefined;
 		for (const part of andParts) {
 			const partSet = await resolveGroupExpression(part, ctx, line);
-			out = out ? new Set([...out].filter((id) => partSet.has(id))) : partSet;
+			out = out ? out.and(partSet) : partSet;
 		}
-		return out ?? new Set();
+		return out ?? IdBitSet.empty(ctx.entries.length);
 	}
 	if (text.startsWith("not ")) {
 		const excluded = await resolveGroupExpression(text.slice(4), ctx, line);
-		return new Set(ctx.entries.map((entry) => entry.id).filter((id) => !excluded.has(id)));
+		return excluded.not();
 	}
 	if (text.startsWith("group(")) {
 		const id = await createGroup(innerCall(text), ctx, line);
-		return new Set(ctx.state.groups[id].entryIds);
+		return IdBitSet.fromIds(ctx.state.groups[id].entryIds, ctx);
 	}
 	if (text.startsWith("group_expr(")) {
 		return resolveGroupExpression(innerCall(text), ctx, line);
 	}
 	if (text.startsWith("temp(")) {
-		return resolveGroupSpec(innerCall(text), ctx, line);
+		return resolveGroupSpecBits(innerCall(text), ctx, line);
 	}
 	if (looksLikeGroupSpec(text)) {
-		return resolveGroupSpec(text, ctx, line);
+		return resolveGroupSpecBits(text, ctx, line);
 	}
 	throw new DslRuntimeError("E_GROUP_EXPR", `Unknown group expression: ${text}. Use a group id like G1, temp(...), all, or a boolean expression.`, line);
 }
@@ -1719,7 +1861,7 @@ function getFieldContains(id: string, field: string | undefined, ctx: RuntimeCon
 	return entry.fieldContains[field] ?? normalizeContainsText(getFieldText(id, field, ctx));
 }
 
-function getIdsComparingFields(comparisons: FieldComparison[], ctx: RuntimeContext, line: number): Set<string> {
+function getIdsComparingFields(comparisons: FieldComparison[], ctx: RuntimeContext, line: number): IdBitSet {
 	const key = comparisons.map((comparison) => [
 		comparison.field,
 		comparison.operator,
@@ -1728,14 +1870,12 @@ function getIdsComparingFields(comparisons: FieldComparison[], ctx: RuntimeConte
 	const cached = ctx.runtimeCache.fieldComparisonIdSets.get(key);
 	if (cached) {
 		ctx.runtimeCache.stats.fieldComparisonHits++;
-		return new Set(cached);
+		return cached;
 	}
 	ctx.runtimeCache.stats.fieldComparisonMisses++;
-	const ids = new Set(ctx.entries
-		.filter((entry) => comparisons.every((comparison) => fieldComparisonMatches(entry.fields[comparison.field], comparison, line)))
-		.map((entry) => entry.id));
+	const ids = IdBitSet.fromPredicate(ctx, (entry) => comparisons.every((comparison) => fieldComparisonMatches(entry.fields[comparison.field], comparison, line)));
 	ctx.runtimeCache.fieldComparisonIdSets.set(key, ids);
-	return new Set(ids);
+	return ids;
 }
 
 function fieldValueEquals(left: unknown, right: unknown): boolean {
@@ -1761,7 +1901,7 @@ async function getDistribution(filter: FilterSpec, groupExpression: string, ctx:
 	if (filter.type === "direction") {
 		throw new DslRuntimeError("E_DISTRIBUTION_FILTER", "distribution supports BM25 and embeddings filters, not direction filters", line);
 	}
-	const ids = [...(await resolveGroupExpression(groupExpression, ctx, line))];
+	const ids = (await resolveGroupExpression(groupExpression, ctx, line)).toIds(ctx);
 	const predicate: FieldTextPredicate = { field: filter.field, text: filter.text };
 	const scoreVector = filter.type === "BM25" ? getBm25ScoreVector(predicate, ctx) : await getEmbeddingScoreVector(predicate, ctx, line);
 	const scores = ids.map((id) => scoreForId(scoreVector, id, ctx));
@@ -1839,13 +1979,13 @@ async function getEmbeddingScoreVector(predicate: FieldTextPredicate, ctx: Runti
 	}
 	ctx.runtimeCache.stats.scoreVectorMisses++;
 	const embedding = await getQueryEmbedding(model, predicate, ctx);
-	const scores = new Float32Array(ctx.entries.length);
-	for (const [index, entry] of ctx.entries.entries()) {
+	const vectorsByEntry: Array<EmbeddingVector | undefined> = [];
+	for (const entry of ctx.entries) {
 		const vectorId = predicate.field ? fieldDocumentId(entry.id, predicate.field) : entry.id;
 		const vectors = ctx.datasetByEntryId.get(entry.id)?.embeddings.vectors;
-		const vector = vectors?.[vectorId] ?? (predicate.field && getFieldText(entry.id, predicate.field, ctx) === entry.text ? vectors?.[entry.id] : undefined);
-		scores[index] = vector ? cosineSimilarity(embedding, vector) : 0;
+		vectorsByEntry.push(vectors?.[vectorId] ?? (predicate.field && getFieldText(entry.id, predicate.field, ctx) === entry.text ? vectors?.[entry.id] : undefined));
 	}
+	const scores = scoreEmbeddingVectorValues(vectorsByEntry, embedding);
 	ctx.runtimeCache.scoreVectors.set(key, scores);
 	return scores;
 }
@@ -1855,7 +1995,7 @@ function scoreForId(scores: Float32Array, id: string, ctx: RuntimeContext): numb
 	return index === undefined ? 0 : (scores[index] ?? 0);
 }
 
-function getIdsAboveScoreThreshold(scoreKeyValue: string, scores: Float32Array, threshold: number, ctx: RuntimeContext): Set<string> {
+function getIdsAboveScoreThreshold(scoreKeyValue: string, scores: Float32Array, threshold: number, ctx: RuntimeContext): IdBitSet {
 	const key = thresholdKey(scoreKeyValue, threshold);
 	const cached = ctx.runtimeCache.thresholdIdSets.get(key);
 	if (cached) {
@@ -1863,20 +2003,17 @@ function getIdsAboveScoreThreshold(scoreKeyValue: string, scores: Float32Array, 
 		return cached;
 	}
 	ctx.runtimeCache.stats.thresholdIdSetMisses++;
-	const ids = new Set<string>();
-	for (const [index, entry] of ctx.entries.entries()) {
-		if ((scores[index] ?? -1) > threshold) ids.add(entry.id);
-	}
+	const ids = IdBitSet.fromPredicate(ctx, (_entry, index) => (scores[index] ?? -1) > threshold);
 	ctx.runtimeCache.thresholdIdSets.set(key, ids);
 	return ids;
 }
 
-function getIdsAboveBm25Threshold(predicate: FieldTextPredicate, threshold: number, ctx: RuntimeContext): Set<string> {
+function getIdsAboveBm25Threshold(predicate: FieldTextPredicate, threshold: number, ctx: RuntimeContext): IdBitSet {
 	const scoreKeyValue = scoreVectorKey("BM25", predicate);
 	return getIdsAboveScoreThreshold(scoreKeyValue, getBm25ScoreVector(predicate, ctx), threshold, ctx);
 }
 
-async function getIdsAboveEmbeddingThreshold(predicate: FieldTextPredicate, threshold: number, ctx: RuntimeContext, line: number): Promise<Set<string>> {
+async function getIdsAboveEmbeddingThreshold(predicate: FieldTextPredicate, threshold: number, ctx: RuntimeContext, line: number): Promise<IdBitSet> {
 	const model = ctx.datasets.find((dataset) => dataset.manifest.embeddingModel)?.manifest.embeddingModel;
 	if (!model) throw new DslRuntimeError("E_EMBEDDING_MODEL", "No embedding model available for active dataset", line);
 	const scoreKeyValue = scoreVectorKey("embeddings", predicate, embeddingRuntimeModelKey(model));
@@ -1927,7 +2064,7 @@ function getTextFilterCacheKey(type: "contains" | "contains_word", predicate: Fi
 	return [type, predicate.field ?? "", predicate.text].join("\0");
 }
 
-function getCachedTextFilterIds(key: string, compute: () => Set<string>, ctx: RuntimeContext): Set<string> {
+function getCachedTextFilterIds(key: string, compute: () => IdBitSet, ctx: RuntimeContext): IdBitSet {
 	const cached = ctx.runtimeCache.textFilterIdSets.get(key);
 	if (cached) {
 		ctx.runtimeCache.stats.textFilterHits++;
@@ -1939,31 +2076,29 @@ function getCachedTextFilterIds(key: string, compute: () => Set<string>, ctx: Ru
 	return ids;
 }
 
-function getIdsContaining(predicate: FieldTextPredicate, ctx: RuntimeContext): Set<string> {
+function getIdsContaining(predicate: FieldTextPredicate, ctx: RuntimeContext): IdBitSet {
 	const needle = normalizeContainsText(predicate.text);
-	return getCachedTextFilterIds(getTextFilterCacheKey("contains", predicate), () => new Set(
-		ctx.entries
-			.filter((entry) => getFieldContains(entry.id, predicate.field, ctx).includes(needle))
-			.map((entry) => entry.id),
-	), ctx);
+	return getCachedTextFilterIds(
+		getTextFilterCacheKey("contains", predicate),
+		() => IdBitSet.fromPredicate(ctx, (entry) => getFieldContains(entry.id, predicate.field, ctx).includes(needle)),
+		ctx,
+	);
 }
 
-function getIdsContainingWord(predicate: FieldTextPredicate, ctx: RuntimeContext, line: number): Set<string> {
+function getIdsContainingWord(predicate: FieldTextPredicate, ctx: RuntimeContext, line: number): IdBitSet {
 	const needle = tokenize(predicate.text);
 	if (needle.length === 0) throw new DslRuntimeError("E_CONTAINS_WORD", `contains_word requires at least one word token, got ${formatValue(predicate.text)}`, line);
 	return getCachedTextFilterIds(getTextFilterCacheKey("contains_word", predicate), () => {
 		if (needle.length === 1) {
 			const token = needle[0];
-			return new Set(ctx.entries.filter((entry) => {
+			return IdBitSet.fromPredicate(ctx, (entry) => {
 				const docId = predicate.field ? fieldDocumentId(entry.id, predicate.field) : entry.id;
 				const termFreq = ctx.datasetByEntryId.get(entry.id)?.bm25.termFreq[docId];
 				if (termFreq) return (termFreq[token] ?? 0) > 0;
 				return containsWord(getFieldText(entry.id, predicate.field, ctx), predicate.text, line);
-			}).map((entry) => entry.id));
+			});
 		}
-		return new Set(ctx.entries
-			.filter((entry) => containsWord(getFieldText(entry.id, predicate.field, ctx), predicate.text, line))
-			.map((entry) => entry.id));
+		return IdBitSet.fromPredicate(ctx, (entry) => containsWord(getFieldText(entry.id, predicate.field, ctx), predicate.text, line));
 	}, ctx);
 }
 

@@ -1,4 +1,5 @@
 import { listDatasets } from "./dataset-store.js";
+import { getQuailDatasetsDir, getQuailStagingDir, getQuailWorkspaceDir } from "./paths.js";
 const ACTIVATION_RE = /@"([^"]+)"/g;
 function getMessageText(message) {
     if (message.role !== "user")
@@ -247,6 +248,9 @@ export function buildQuailMainSystemPrompt(options) {
     return FIELD_BASED_MAIN_SYSTEM_PROMPT.replace("{{ACTIVE_DATASETS}}", formatActiveDatasets(options.activeDatasets));
 }
 export function buildQuailProcessingSystemPrompt(cwd) {
+    const workspaceDir = getQuailWorkspaceDir(cwd);
+    const stagingDir = getQuailStagingDir(cwd);
+    const datasetsDir = getQuailDatasetsDir(cwd);
     return `You are the Quail processing agent. You are a temporary side agent whose conversation is not kept in the main research thread. Your job is to help the user process, add, inspect, or remove field-based qualitative datasets for Quail.
 
 Quail datasets are field-based. A record may have many source fields. Preserve source fields as fields. Quail analysis tags/codes are added later during analysis and are not the same thing as source fields.
@@ -255,12 +259,13 @@ You are a Pi coding agent with file and shell tools. Be conversational until the
 
 Workspace rules:
 - The Quail repo cwd is: ${cwd}
-- You may write staging files under workspace/staging/.
-- Processed datasets live under workspace/datasets/.
+- The active Quail workspace is: ${workspaceDir}
+- You may write staging files under: ${stagingDir}
+- Processed datasets live under: ${datasetsDir}
 - Do not modify source files unless the user explicitly asks for Quail code changes. Processing normal datasets should use the dataset CLI.
 
 Required before processing a dataset:
-1. The dataset itself: either a file path or pasted text. If the user pasted text, write it to workspace/staging/<short-name>.txt before running the CLI.
+1. The dataset itself: either a file path or pasted text. If the user pasted text, write it to the active staging directory before running the CLI.
 2. Global source fields. Ask whether any global fields should be added to every response, such as source, audience, year, cohort, or project. Use --tag field=value for these global source fields.
 3. Field/type confirmation. Run hatch dataset inspect --input "/absolute/path" before processing, including any --tag field=value global source fields. Show the inferred field types as a Markdown table with columns Field, Type, Embedded, Non-empty, and Sample, along with the record count. String fields are embedded and prepared for BM25/contains text search; non-string fields are preserved for exact matching and counting. Ask the user to confirm or provide type overrides.
 4. A unique dataset name. Check uniqueness with hatch dataset list. If hatch is unavailable, use node dist/cli.js dataset list after npm run build.
@@ -271,7 +276,7 @@ Preferred commands:
 - Inspect before processing: hatch dataset inspect --input "/absolute/path" --tag field=value
 - Override an inferred field type during inspect or process: --field-type "Field Name=string"
 - Process from a file: hatch dataset process --name "Dataset Name" --input "/absolute/path" --model embeddinggemma:latest --batch-size 64 --tag field=value
-- Process pasted text: write the paste to workspace/staging/name.txt, then run the same process command with --input.
+- Process pasted text: write the paste to the active staging directory, then run the same process command with --input.
 - Remove a dataset: hatch dataset remove "Dataset Name" --yes
 
 If hatch has not been installed or points to another command, run npm run build from ${cwd}, then use node dist/cli.js dataset ... from ${cwd}.

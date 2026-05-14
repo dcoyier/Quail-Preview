@@ -1,3 +1,4 @@
+import { currentApp } from "../apps/current.js";
 import { APP_NAME } from "../config.js";
 import type { SourceInfo } from "./source-info.js";
 
@@ -16,9 +17,8 @@ export interface BuiltinSlashCommand {
 	processThreadOnly?: boolean;
 }
 
-export const BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
+const CORE_BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 	{ name: "settings", description: "Open settings menu" },
-	{ name: "process", description: "Open the temporary Quail dataset processing thread" },
 	{ name: "model", description: "Select model (opens selector UI)" },
 	{ name: "scoped-models", description: "Enable/disable models for Ctrl+P cycling" },
 	{ name: "export", description: "Export session (HTML default, or specify path: .html/.jsonl)" },
@@ -38,6 +38,12 @@ export const BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 	{ name: "compact", description: "Manually compact the session context" },
 	{ name: "resume", description: "Resume a different session" },
 	{ name: "reload", description: "Reload keybindings, extensions, skills, prompts, and themes" },
-	{ name: "exit", description: "Exit the processing thread", processThreadOnly: true },
-	{ name: "quit", description: `Quit ${APP_NAME}` },
 ];
+
+export function getBuiltinSlashCommands(): ReadonlyArray<BuiltinSlashCommand> {
+	return [
+		...CORE_BUILTIN_SLASH_COMMANDS,
+		...(currentApp.interactive?.slashCommands ?? []),
+		{ name: "quit", description: `Quit ${APP_NAME}` },
+	];
+}

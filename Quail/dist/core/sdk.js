@@ -1,7 +1,8 @@
 import { join } from "node:path";
 import { Agent } from "@mariozechner/pi-agent-core";
 import { streamSimple } from "@mariozechner/pi-ai";
-import { APP_NAME, getAgentDir, getDocsPath } from "../config.js";
+import { currentApp } from "../apps/current.js";
+import { getAgentDir, getDocsPath } from "../config.js";
 import { AgentSession } from "./agent-session.js";
 import { AuthStorage } from "./auth-storage.js";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js";
@@ -13,7 +14,6 @@ import { getDefaultSessionDir, SessionManager } from "./session-manager.js";
 import { SettingsManager } from "./settings-manager.js";
 import { isInstallTelemetryEnabled } from "./telemetry.js";
 import { time } from "./timings.js";
-import { createQuailQueryToolDefinition } from "../quail/query-tool.js";
 import { createBashTool, createCodingTools, createEditTool, createFindTool, createGrepTool, createLsTool, createReadOnlyTools, createReadTool, createWriteTool, withFileMutationQueue, } from "./tools/index.js";
 // Re-exports
 export * from "./agent-session-runtime.js";
@@ -137,19 +137,15 @@ export async function createAgentSession(options = {}) {
     if (!model || !model.reasoning) {
         thinkingLevel = "off";
     }
-    const defaultActiveToolNames = APP_NAME === "quail" ? ["quail"] : ["read", "bash", "edit", "write"];
+    const defaultActiveToolNames = currentApp.defaultActiveToolNames?.slice() ?? ["read", "bash", "edit", "write"];
     const allowedToolNames = options.tools ?? (options.noTools === "all" ? [] : undefined);
     const initialActiveToolNames = options.tools
         ? [...options.tools]
         : options.noTools
             ? []
             : defaultActiveToolNames;
-    const customTools = APP_NAME === "quail"
-        ? [
-            ...(options.customTools ?? []),
-            createQuailQueryToolDefinition(cwd, sessionManager),
-        ]
-        : options.customTools;
+    const appTools = currentApp.createToolDefinitions?.({ cwd, sessionManager }) ?? [];
+    const customTools = options.customTools || appTools.length > 0 ? [...(options.customTools ?? []), ...appTools] : undefined;
     let agent;
     // Create convertToLlm wrapper that filters images if blockImages is enabled (defense-in-depth)
     const convertToLlmWithBlockImages = (messages) => {

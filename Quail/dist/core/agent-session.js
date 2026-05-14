@@ -15,9 +15,9 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { isContextOverflow, modelsAreEqual, resetApiProviders, supportsXhigh } from "@mariozechner/pi-ai";
-import { APP_NAME, getDocsPath } from "../config.js";
+import { currentApp } from "../apps/current.js";
+import { getDocsPath } from "../config.js";
 import { theme } from "../modes/interactive/theme/theme.js";
-import { createQuailAnalysisResultMessage, getActiveDatasetsForPrompt, runQuailAnalysisCalls } from "../quail/index.js";
 import { stripFrontmatter } from "../utils/frontmatter.js";
 import { sleep } from "../utils/sleep.js";
 import { executeBashWithOperations } from "./bash-executor.js";
@@ -339,23 +339,23 @@ export class AgentSession {
                     return; // Retry was initiated, don't proceed to compaction
             }
             this._resolveRetry();
-            if (APP_NAME === "quail" && msg.stopReason !== "aborted" && msg.stopReason !== "error") {
-                const didRunQuailCall = await this._handleQuailAnalysisCalls(msg);
-                if (didRunQuailCall)
+            if (msg.stopReason !== "aborted" && msg.stopReason !== "error") {
+                const didRunAppFollowUp = await this._handleAppAssistantMessage(msg);
+                if (didRunAppFollowUp)
                     return;
             }
             await this._checkCompaction(msg);
         }
     }
-    async _handleQuailAnalysisCalls(assistantMessage) {
-        const result = await runQuailAnalysisCalls({
+    async _handleAppAssistantMessage(assistantMessage) {
+        const messages = await currentApp.afterAssistantMessage?.({
             cwd: this._cwd,
             sessionManager: this.sessionManager,
             assistantMessage,
         });
-        if (!result)
+        if (!messages || messages.length === 0)
             return false;
-        await this.agent.prompt([createQuailAnalysisResultMessage(result.message)]);
+        await this.agent.prompt(messages);
         return true;
     }
     /** Resolve the pending retry promise */
@@ -662,6 +662,10 @@ export class AgentSession {
         const appendSystemPrompt = loaderAppendSystemPrompt.length > 0 ? loaderAppendSystemPrompt.join("\n\n") : undefined;
         const loadedSkills = this._resourceLoader.getSkills().skills;
         const loadedContextFiles = this._resourceLoader.getAgentsFiles().agentsFiles;
+        const appSystemPromptContext = currentApp.getSystemPromptContext?.({
+            cwd: this._cwd,
+            messages: this.agent.state.messages,
+        });
         this._baseSystemPromptOptions = {
             cwd: this._cwd,
             skills: loadedSkills,
@@ -671,7 +675,7 @@ export class AgentSession {
             selectedTools: validToolNames,
             toolSnippets,
             promptGuidelines,
-            quailActiveDatasets: APP_NAME === "quail" ? getActiveDatasetsForPrompt(this._cwd, this.agent.state.messages) : undefined,
+            ...appSystemPromptContext,
         };
         return buildSystemPrompt(this._baseSystemPromptOptions);
     }
@@ -776,10 +780,9 @@ export class AgentSession {
                 messages.push(msg);
             }
             this._pendingNextTurnMessages = [];
-            // Quail dataset activation is expressed in user text as @"Dataset".
-            // Rebuild the base prompt against the branch plus the pending user turn
-            // before extensions and the provider see this request.
-            if (APP_NAME === "quail") {
+            // Some product adapters derive prompt context from the pending user turn.
+            // Rebuild before extensions and the provider see this request.
+            if (currentApp.shouldRebuildSystemPromptForUserMessage) {
                 const previousMessages = this.agent.state.messages;
                 this.agent.state.messages = [...previousMessages, ...messages];
                 try {

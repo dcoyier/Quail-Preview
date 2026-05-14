@@ -1,5 +1,15 @@
 // Core session management
 
+export { currentApp, isCurrentApp } from "./apps/current.js";
+export type {
+	AppDefinition,
+	AppHeaderOptions,
+	AppInteractiveAdapter,
+	AppProcessingThreadAdapter,
+	AppSlashCommand,
+	AppStartupContent,
+} from "./apps/types.js";
+
 // Config paths
 export { getAgentDir, VERSION } from "./config.js";
 export {

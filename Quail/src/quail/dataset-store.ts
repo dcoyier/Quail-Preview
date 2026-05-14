@@ -12,7 +12,7 @@ import {
 	writeSync,
 } from "node:fs";
 import { basename, extname, join } from "node:path";
-import { ensureQuailWorkspace, getQuailDatasetsDir } from "./paths.js";
+import { ensureQuailWorkspace, getQuailDatasetsDir, getQuailWorkspaceDir } from "./paths.js";
 import { normalizeContainsText, slugifyDatasetName, stableEntryId, tokenize } from "./text.js";
 
 export interface CorpusEntryInput {
@@ -101,6 +101,8 @@ export interface QuailDatasetManifest {
 
 export interface LoadedQuailDataset {
 	manifest: QuailDatasetManifest;
+	workspaceDir: string;
+	datasetDir: string;
 	entries: QuailEntry[];
 	bm25: Bm25Index;
 	embeddings: EmbeddingIndex;
@@ -138,7 +140,7 @@ const MANIFEST_FILE = "manifest.json";
 const ROOT_MANIFEST_FILE = "manifest.json";
 const DEFAULT_EMBEDDING_MODEL = "embeddinggemma:latest";
 const DEFAULT_BATCH_SIZE = 64;
-const MAX_EAGER_VECTOR_FILE_BYTES = 1.5 * 1024 * 1024 * 1024;
+const DEFAULT_MAX_EAGER_VECTOR_FILE_BYTES = 1.5 * 1024 * 1024 * 1024;
 const FIELD_DOC_SEPARATOR = "\u0000";
 const LEGACY_TEXT_FIELD = "text";
 
@@ -155,6 +157,10 @@ const loadedDatasetCache = new Map<string, LoadedDatasetCacheEntry>();
 
 function datasetDir(cwd: string, slug: string): string {
 	return join(getQuailDatasetsDir(cwd), slug);
+}
+
+function datasetCacheKey(cwd: string, slug: string): string {
+	return datasetDir(cwd, slug);
 }
 
 function readJson<T>(path: string): T {
@@ -197,6 +203,13 @@ function isBinaryEmbeddingIndexFile(value: unknown): value is BinaryEmbeddingInd
 	return record.format === "float32-binary-v1" && typeof record.model === "string";
 }
 
+function maxEagerVectorFileBytes(): number {
+	const value = process.env.QUAIL_EAGER_VECTOR_FILE_BYTES?.trim();
+	if (!value) return DEFAULT_MAX_EAGER_VECTOR_FILE_BYTES;
+	const parsed = Number(value);
+	return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_MAX_EAGER_VECTOR_FILE_BYTES;
+}
+
 function hasDotProduct(vector: EmbeddingVector): vector is DotProductEmbeddingVector {
 	return typeof (vector as Partial<DotProductEmbeddingVector>).dotProduct === "function";
 }
@@ -216,6 +229,14 @@ class FileBackedEmbeddingVector implements DotProductEmbeddingVector {
 	dotProduct(other: EmbeddingVector): number {
 		if (other instanceof FileBackedEmbeddingVector) return this.store.dotProduct(this.index, other.toFloat32Array());
 		return this.store.dotProduct(this.index, other);
+	}
+
+	bulkStore(): FileBackedEmbeddingStore {
+		return this.store;
+	}
+
+	bulkIndex(): number {
+		return this.index;
 	}
 
 	toFloat32Array(): Float32Array {
@@ -239,6 +260,43 @@ class FileBackedEmbeddingStore {
 		let sum = 0;
 		for (let i = 0; i < n; i++) sum += (other[i] ?? 0) * this.scratch.readFloatLE(i * 4);
 		return sum;
+	}
+
+	dotProducts(indices: readonly number[], other: EmbeddingVector): Float32Array {
+		const scores = new Float32Array(indices.length);
+		if (this.dimensions <= 0 || other.length === 0 || indices.length === 0) return scores;
+		const bytesPerVector = this.dimensions * 4;
+		const maxChunkBytes = 8 * 1024 * 1024;
+		const maxVectorsPerChunk = Math.max(1, Math.floor(maxChunkBytes / bytesPerVector));
+		let offset = 0;
+		while (offset < indices.length) {
+			const startIndex = indices[offset];
+			if (startIndex < 0) {
+				offset++;
+				continue;
+			}
+			let count = 1;
+			while (
+				offset + count < indices.length &&
+				count < maxVectorsPerChunk &&
+				indices[offset + count] === startIndex + count
+			) {
+				count++;
+			}
+			const buffer = Buffer.allocUnsafe(count * bytesPerVector);
+			readSync(this.fd, buffer, 0, buffer.byteLength, startIndex * bytesPerVector);
+			const n = Math.min(other.length, this.dimensions);
+			for (let row = 0; row < count; row++) {
+				let sum = 0;
+				const rowOffset = row * bytesPerVector;
+				for (let dimension = 0; dimension < n; dimension++) {
+					sum += (other[dimension] ?? 0) * buffer.readFloatLE(rowOffset + dimension * 4);
+				}
+				scores[offset + row] = sum;
+			}
+			offset += count;
+		}
+		return scores;
 	}
 
 	readVector(index: number): Float32Array {
@@ -303,7 +361,7 @@ function loadEmbeddingIndex(dir: string, fileName: string): EmbeddingIndex {
 	const vectorSize = statSync(vectorPath).size;
 	const vectors: Record<string, EmbeddingVector> = {};
 	const bytesPerVector = dimensions * 4;
-	if (dimensions > 0 && vectorSize > MAX_EAGER_VECTOR_FILE_BYTES) {
+	if (dimensions > 0 && vectorSize > maxEagerVectorFileBytes()) {
 		const fd = openSync(vectorPath, "r");
 		const store = new FileBackedEmbeddingStore(fd, dimensions);
 		for (let i = 0; i < ids.length; i++) {
@@ -791,6 +849,33 @@ export function cosineSimilarity(a: EmbeddingVector, b: EmbeddingVector): number
 	return sum;
 }
 
+export function scoreEmbeddingVectorValues(vectors: ReadonlyArray<EmbeddingVector | undefined>, query: EmbeddingVector): Float32Array {
+	const firstFileBacked = vectors.find((vector): vector is FileBackedEmbeddingVector => vector instanceof FileBackedEmbeddingVector);
+	if (firstFileBacked) {
+		const store = firstFileBacked.bulkStore();
+		const indices: number[] = [];
+		let canBulkScan = true;
+		for (const vector of vectors) {
+			if (!vector) {
+				indices.push(-1);
+				continue;
+			}
+			if (!(vector instanceof FileBackedEmbeddingVector) || vector.bulkStore() !== store) {
+				canBulkScan = false;
+				break;
+			}
+			indices.push(vector.bulkIndex());
+		}
+		if (canBulkScan) return store.dotProducts(indices, query);
+	}
+	const scores = new Float32Array(vectors.length);
+	for (let index = 0; index < vectors.length; index++) {
+		const vector = vectors[index];
+		scores[index] = vector ? cosineSimilarity(query, vector) : 0;
+	}
+	return scores;
+}
+
 async function embedBatch(model: string, inputs: string[]): Promise<number[][]> {
 	const embedUrl = process.env.QUAIL_OLLAMA_EMBED_URL ?? "http://127.0.0.1:11434/api/embed";
 	const response = await fetch(embedUrl, {
@@ -867,7 +952,7 @@ export function removeDataset(cwd: string, name: string): boolean {
 	const dir = datasetDir(cwd, slug);
 	if (!existsSync(dir)) return false;
 	rmSync(dir, { recursive: true, force: true });
-	loadedDatasetCache.delete(`${cwd}\0${slug}`);
+	loadedDatasetCache.delete(datasetCacheKey(cwd, slug));
 	writeRootManifest(cwd);
 	return true;
 }
@@ -926,7 +1011,7 @@ export function loadDataset(cwd: string, name: string): LoadedQuailDataset {
 	const bm25Path = join(dir, manifest.files.bm25);
 	const embeddingsPath = join(dir, manifest.files.embeddings);
 	const vectorPath = join(dir, EMBEDDINGS_VECTOR_FILE);
-	const cacheKey = `${cwd}\0${slug}`;
+	const cacheKey = datasetCacheKey(cwd, slug);
 	const manifestMtimeMs = getMtimeMs(manifestPath);
 	const entriesMtimeMs = getMtimeMs(entriesPath);
 	const bm25MtimeMs = getMtimeMs(bm25Path);
@@ -960,7 +1045,7 @@ export function loadDataset(cwd: string, name: string): LoadedQuailDataset {
 	}
 	const bm25 = readJson<Bm25Index>(bm25Path);
 	const embeddings = loadEmbeddingIndex(dir, manifest.files.embeddings);
-	const dataset = { manifest, entries, bm25, embeddings };
+	const dataset = { manifest, workspaceDir: getQuailWorkspaceDir(cwd), datasetDir: dir, entries, bm25, embeddings };
 	loadedDatasetCache.set(cacheKey, {
 		manifestMtimeMs,
 		entriesMtimeMs,
@@ -997,7 +1082,7 @@ export async function processDataset(options: ProcessDatasetOptions): Promise<Qu
 	if (existsSync(join(dir, MANIFEST_FILE)) && !options.overwrite) {
 		throw new Error(`Dataset name must be unique. "${name}" already exists.`);
 	}
-	loadedDatasetCache.delete(`${cwd}\0${slug}`);
+	loadedDatasetCache.delete(datasetCacheKey(cwd, slug));
 	options.onProgress?.("[1/6] Reading and structuring corpus");
 	const parsed = parseCorpusFile(options.inputPath, { format: options.format, textColumn: options.textColumn });
 	if (parsed.length === 0) throw new Error("No entries found in corpus");
@@ -1055,7 +1140,7 @@ export async function processDataset(options: ProcessDatasetOptions): Promise<Qu
 		};
 	}
 
-	options.onProgress?.("[5/6] Writing dataset files into workspace/datasets");
+	options.onProgress?.(`[5/6] Writing dataset files into ${getQuailDatasetsDir(cwd)}`);
 	mkdirSync(dir, { recursive: true });
 	writeFileSync(join(dir, ENTRIES_FILE), `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`, "utf8");
 	writeJson(join(dir, BM25_FILE), bm25);

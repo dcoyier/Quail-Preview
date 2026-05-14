@@ -1,7 +1,7 @@
 import { existsSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import chalk from "chalk";
-import { ensureQuailWorkspace, getQuailStagingDir } from "./paths.js";
+import { ensureQuailWorkspace, getQuailDatasetsDir, getQuailStagingDir } from "./paths.js";
 import { datasetExists, inspectDatasetFile, listDatasets, processDataset, removeDataset, type FieldTypeOverride } from "./dataset-store.js";
 
 interface DatasetCliArgs {
@@ -165,12 +165,12 @@ export async function handleDatasetCommand(args: string[], cwd = process.cwd()):
 
 	try {
 		switch (parsed.command) {
-			case "list": {
-				const datasets = listDatasets(cwd);
-				if (datasets.length === 0) {
-					console.log("No processed datasets in workspace/datasets yet.");
-					return true;
-				}
+				case "list": {
+					const datasets = listDatasets(cwd);
+					if (datasets.length === 0) {
+						console.log(`No processed datasets in ${getQuailDatasetsDir(cwd)} yet.`);
+						return true;
+					}
 				for (const item of datasets) {
 					console.log(
 						`${item.name}\t${item.entryCount} entries\t${item.embeddingModel}\tfields: ${item.metadataFields.join(", ") || "none"}`,

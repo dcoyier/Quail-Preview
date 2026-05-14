@@ -73,6 +73,8 @@ export interface QuailDatasetManifest {
 }
 export interface LoadedQuailDataset {
     manifest: QuailDatasetManifest;
+    workspaceDir: string;
+    datasetDir: string;
     entries: QuailEntry[];
     bm25: Bm25Index;
     embeddings: EmbeddingIndex;
@@ -109,6 +111,7 @@ export declare function buildBm25Index(entries: QuailEntry[], fieldTypes?: Recor
 export declare function bm25Score(index: Bm25Index, entryId: string, query: string): number;
 export declare function bm25ScoreTerms(index: Bm25Index, entryId: string, terms: readonly string[]): number;
 export declare function cosineSimilarity(a: EmbeddingVector, b: EmbeddingVector): number;
+export declare function scoreEmbeddingVectorValues(vectors: ReadonlyArray<EmbeddingVector | undefined>, query: EmbeddingVector): Float32Array;
 export declare function embedTexts(texts: string[], options?: {
     model?: string;
     batchSize?: number;

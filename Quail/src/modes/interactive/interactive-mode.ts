@@ -56,6 +56,7 @@ import {
 	getUpdateInstruction,
 	VERSION,
 } from "../../config.js";
+import { currentApp } from "../../apps/current.js";
 import { type AgentSession, type AgentSessionEvent, parseSkillBlock } from "../../core/agent-session.js";
 import { type AgentSessionRuntime, SessionImportFileNotFoundError } from "../../core/agent-session-runtime.js";
 import type {
@@ -75,7 +76,7 @@ import { DefaultPackageManager } from "../../core/package-manager.js";
 import type { ResourceDiagnostic } from "../../core/resource-loader.js";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.js";
 import { type SessionContext, SessionManager } from "../../core/session-manager.js";
-import { BUILTIN_SLASH_COMMANDS } from "../../core/slash-commands.js";
+import { getBuiltinSlashCommands } from "../../core/slash-commands.js";
 import type { SourceInfo } from "../../core/source-info.js";
 import { isInstallTelemetryEnabled } from "../../core/telemetry.js";
 import type { TruncationResult } from "../../core/tools/truncate.js";
@@ -85,8 +86,6 @@ import { extensionForImageMimeType, readClipboardImage } from "../../utils/clipb
 import { parseGitUrl } from "../../utils/git.js";
 import { killTrackedDetachedChildren } from "../../utils/shell.js";
 import { ensureTool } from "../../utils/tools-manager.js";
-import { buildQuailProcessingSystemPrompt } from "../../quail/index.js";
-import { listDatasets } from "../../quail/dataset-store.js";
 import { ArminComponent } from "./components/armin.js";
 import { AssistantMessageComponent } from "./components/assistant-message.js";
 import { BashExecutionComponent } from "./components/bash-execution.js";
@@ -154,93 +153,6 @@ class ExpandableText extends Text implements Expandable {
 
 	setExpanded(expanded: boolean): void {
 		this.setText(expanded ? this.getExpandedText() : this.getCollapsedText());
-	}
-}
-
-const QUAIL_ASCII = ["   ,", "  (')>", "/(V)", " ^ ^"];
-
-class QuailHeader extends Text implements Expandable {
-	constructor(
-		private readonly title: string,
-		private readonly compactInstructions: string,
-		private readonly expandedInstructions: string,
-		private readonly onboarding: string,
-		private readonly footer: string,
-		expanded = false,
-	) {
-		super("", 0, 0);
-		this.setExpanded(expanded);
-	}
-
-	setExpanded(expanded: boolean): void {
-		const lines = QUAIL_ASCII.map((line) => theme.fg("accent", `  ${line}`));
-		lines.push("");
-		lines.push(theme.fg("accent", `  ${this.title}`));
-		lines.push("");
-		lines.push(...this.indentLines(expanded ? this.expandedInstructions : this.compactInstructions));
-		lines.push(...this.indentLines(this.onboarding));
-		lines.push(...this.indentLines(this.footer));
-		this.setText(lines.join("\n"));
-	}
-
-	private indentLines(text: string): string[] {
-		return text.split("\n").map((line) => ` ${line}`);
-	}
-}
-
-class QuailDatasetAutocompleteProvider implements AutocompleteProvider {
-	constructor(
-		private readonly delegate: AutocompleteProvider,
-		private readonly getCwd: () => string,
-	) {}
-
-	async getSuggestions(
-		lines: string[],
-		cursorLine: number,
-		cursorCol: number,
-		options: { signal: AbortSignal; force?: boolean },
-	): Promise<{ items: AutocompleteItem[]; prefix: string } | null> {
-		const line = lines[cursorLine] ?? "";
-		const beforeCursor = line.slice(0, cursorCol);
-		const match = beforeCursor.match(/@\"([^\"\n]*)$/) ?? beforeCursor.match(/@([^\s\"\n]*)$/);
-		if (match) {
-			const query = match[1] ?? "";
-			const prefix = match[0];
-			const datasets = listDatasets(this.getCwd()).map((dataset) => ({
-				value: prefix.startsWith("@\"") ? `@\"${dataset.name}\"` : `@${dataset.name}`,
-				label: dataset.name,
-				description: `${dataset.entryCount} entries`,
-				insertText: `@\"${dataset.name}\"`,
-			}));
-			const items = query ? fuzzyFilter(datasets, query, (item) => `${item.label} ${item.description ?? ""}`) : datasets;
-			return items.length > 0 ? { items, prefix } : null;
-		}
-		return this.delegate.getSuggestions(lines, cursorLine, cursorCol, options);
-	}
-
-	applyCompletion(
-		lines: string[],
-		cursorLine: number,
-		cursorCol: number,
-		item: AutocompleteItem,
-		prefix: string,
-	): { lines: string[]; cursorLine: number; cursorCol: number } {
-		if (prefix.startsWith("@")) {
-			const nextLines = [...lines];
-			const line = nextLines[cursorLine] ?? "";
-			const start = Math.max(0, cursorCol - prefix.length);
-			const insertText = "insertText" in item && typeof item.insertText === "string" ? item.insertText : item.value;
-			nextLines[cursorLine] = `${line.slice(0, start)}${insertText}${line.slice(cursorCol)}`;
-			return { lines: nextLines, cursorLine, cursorCol: start + insertText.length };
-		}
-		return this.delegate.applyCompletion(lines, cursorLine, cursorCol, item, prefix);
-	}
-
-	shouldTriggerFileCompletion(lines: string[], cursorLine: number, cursorCol: number): boolean {
-		const line = lines[cursorLine] ?? "";
-		const beforeCursor = line.slice(0, cursorCol);
-		if (/@(\"[^\"]*|[^\s\"]*)$/.test(beforeCursor)) return true;
-		return this.delegate.shouldTriggerFileCompletion?.(lines, cursorLine, cursorCol) ?? false;
 	}
 }
 
@@ -520,7 +432,7 @@ export class InteractiveMode {
 	}
 
 	private getBuiltInCommandConflictDiagnostics(extensionRunner: ExtensionRunner): ResourceDiagnostic[] {
-		const builtinNames = new Set(BUILTIN_SLASH_COMMANDS.map((command) => command.name));
+		const builtinNames = new Set(getBuiltinSlashCommands().map((command) => command.name));
 		return extensionRunner
 			.getRegisteredCommands()
 			.filter((command) => builtinNames.has(command.name))
@@ -536,8 +448,8 @@ export class InteractiveMode {
 
 	private createBaseAutocompleteProvider(): AutocompleteProvider {
 		// Define commands for autocomplete
-		const slashCommands: SlashCommand[] = BUILTIN_SLASH_COMMANDS.filter(
-			(command) => !command.processThreadOnly || this.isQuailProcessingThread(),
+		const slashCommands: SlashCommand[] = getBuiltinSlashCommands().filter(
+			(command) => !command.processThreadOnly || this.isAppProcessingThread(),
 		).map((command) => ({
 			name: command.name,
 			description: command.description,
@@ -615,9 +527,7 @@ export class InteractiveMode {
 
 	private setupAutocompleteProvider(): void {
 		let provider = this.createBaseAutocompleteProvider();
-		if (APP_NAME === "quail") {
-			provider = new QuailDatasetAutocompleteProvider(provider, () => this.sessionManager.getCwd());
-		}
+		provider = currentApp.interactive?.wrapAutocompleteProvider?.(provider, () => this.sessionManager.getCwd()) ?? provider;
 		for (const wrapProvider of this.autocompleteProviderWrappers) {
 			provider = wrapProvider(provider);
 		}
@@ -677,8 +587,7 @@ export class InteractiveMode {
 
 		// Add header with keybindings from config (unless silenced)
 		if (this.options.verbose || !this.settingsManager.getQuietStartup()) {
-			const isProcessingThread = this.isQuailProcessingThread();
-			const quailTitle = isProcessingThread ? "Quail Process" : "Quail";
+			const isProcessingThread = this.isAppProcessingThread();
 			const logo = theme.bold(theme.fg("accent", APP_NAME)) + theme.fg("dim", ` v${this.version}`);
 
 			// Build startup instructions using keybinding hint helpers
@@ -705,46 +614,38 @@ export class InteractiveMode {
 				hint("app.clipboard.pasteImage", "to paste image"),
 				rawKeyHint("drop files", "to attach"),
 			].join("\n");
+			const appStartupContent = currentApp.interactive?.getStartupContent?.({ isProcessingThread });
 			const compactInstructions =
-				APP_NAME === "quail"
-					? theme.fg("muted", "escape interrupt · ctrl+c/ctrl+d clear/exit · / commands")
-					: [
-							hint("app.interrupt", "interrupt"),
-							rawKeyHint(`${keyText("app.clear")}/${keyText("app.exit")}`, "clear/exit"),
-							rawKeyHint("/", "commands"),
-							rawKeyHint("!", "bash"),
-							hint("app.tools.expand", "more"),
-						].join(theme.fg("muted", " · "));
+				appStartupContent?.compactInstructions ??
+				[
+					hint("app.interrupt", "interrupt"),
+					rawKeyHint(`${keyText("app.clear")}/${keyText("app.exit")}`, "clear/exit"),
+					rawKeyHint("/", "commands"),
+					rawKeyHint("!", "bash"),
+					hint("app.tools.expand", "more"),
+				].join(theme.fg("muted", " · "));
 			const compactOnboarding =
-				APP_NAME === "quail"
-					? theme.fg("dim", isProcessingThread ? "temporary dataset processing thread" : "a pi fork")
-					: theme.fg("dim", `Press ${keyText("app.tools.expand")} to show full startup help and loaded resources.`);
+				appStartupContent?.compactOnboarding ??
+				theme.fg("dim", `Press ${keyText("app.tools.expand")} to show full startup help and loaded resources.`);
 			const onboarding =
-				APP_NAME === "quail"
-					? theme.fg(
-							"muted",
-							isProcessingThread
-								? "Process, inspect, or remove a dataset here. Exit to return to the main Quail thread."
-								: "activate a processed dataset with @\"Dataset Name\" or use /process to add one",
-						)
-					: theme.fg("dim", `Pi can explain its own features and look up its docs. Ask it how to use or extend Pi.`);
-			this.builtInHeader =
-				APP_NAME === "quail"
-					? new QuailHeader(
-							quailTitle,
-							compactInstructions,
-							expandedInstructions,
-							onboarding,
-							compactOnboarding,
-							this.getStartupExpansionState(),
-						)
-					: new ExpandableText(
-							() => `${logo}\n${compactInstructions}\n${compactOnboarding}\n\n${onboarding}`,
-							() => `${logo}\n${expandedInstructions}\n\n${onboarding}`,
-							this.getStartupExpansionState(),
-							1,
-							0,
-						);
+				appStartupContent?.onboarding ??
+				theme.fg("dim", `Pi can explain its own features and look up its docs. Ask it how to use or extend Pi.`);
+			this.builtInHeader = currentApp.interactive?.createHeader
+				? currentApp.interactive.createHeader({
+						title: appStartupContent?.title ?? currentApp.title,
+						compactInstructions,
+						expandedInstructions,
+						onboarding,
+						footer: compactOnboarding,
+						expanded: this.getStartupExpansionState(),
+					})
+				: new ExpandableText(
+						() => `${logo}\n${compactInstructions}\n${compactOnboarding}\n\n${onboarding}`,
+						() => `${logo}\n${expandedInstructions}\n\n${onboarding}`,
+						this.getStartupExpansionState(),
+						1,
+						0,
+					);
 
 			// Setup UI layout
 			this.headerContainer.addChild(new Spacer(1));
@@ -815,9 +716,8 @@ export class InteractiveMode {
 	async run(): Promise<void> {
 		await this.init();
 
-		// Start version check asynchronously. Quail is a fork and must not surface Pi npm
-		// release notices such as "install @mariozechner/pi-coding-agent".
-		if (APP_NAME !== "quail") {
+		// Start version check asynchronously when the active app uses upstream Pi releases.
+		if (!currentApp.suppressUpstreamVersionCheck) {
 			this.checkForNewVersion().then((newVersion) => {
 				if (newVersion) {
 					this.showNewVersionNotification(newVersion);
@@ -826,7 +726,7 @@ export class InteractiveMode {
 		}
 
 		// Processing threads should stay focused on dataset work, not package-manager maintenance.
-		if (!this.isQuailProcessingThread()) {
+		if (!this.isAppProcessingThread()) {
 			this.checkForPackageUpdates().then((updates) => {
 				if (updates.length > 0) {
 					this.showPackageUpdateNotification(updates);
@@ -896,7 +796,7 @@ export class InteractiveMode {
 	 * Check npm registry for a newer version.
 	 */
 	private async checkForNewVersion(): Promise<string | undefined> {
-		if (APP_NAME === "quail") return undefined;
+		if (currentApp.suppressUpstreamVersionCheck) return undefined;
 		if (process.env.PI_SKIP_VERSION_CHECK || process.env.PI_OFFLINE) return undefined;
 
 		try {
@@ -919,7 +819,7 @@ export class InteractiveMode {
 	}
 
 	private async checkForPackageUpdates(): Promise<string[]> {
-		if (this.isQuailProcessingThread()) {
+		if (this.isAppProcessingThread()) {
 			return [];
 		}
 		if (process.env.PI_OFFLINE) {
@@ -991,9 +891,7 @@ export class InteractiveMode {
 	 * Only shows new entries since last seen version, skips for resumed sessions.
 	 */
 	private getChangelogForDisplay(): string | undefined {
-		// Quail currently ships with Pi's upstream CHANGELOG.md in the forked tree.
-		// Showing that as Quail startup news is confusing, especially in /process.
-		if (APP_NAME === "quail") {
+		if (currentApp.suppressUpstreamChangelog) {
 			return undefined;
 		}
 
@@ -1023,8 +921,8 @@ export class InteractiveMode {
 		return undefined;
 	}
 
-	private isQuailProcessingThread(): boolean {
-		return APP_NAME === "quail" && process.env.QUAIL_PROCESS_THREAD === "1";
+	private isAppProcessingThread(): boolean {
+		return currentApp.processingThread?.isActive() ?? false;
 	}
 
 	private reportInstallTelemetry(version: string): void {
@@ -2574,7 +2472,7 @@ export class InteractiveMode {
 			const normalizedText = text.toLowerCase();
 
 			if (
-				this.isQuailProcessingThread() &&
+				this.isAppProcessingThread() &&
 				(normalizedText === "/exit" ||
 					normalizedText === "/quit" ||
 					normalizedText === "exit" ||
@@ -3637,7 +3535,7 @@ export class InteractiveMode {
 	}
 
 	showNewVersionNotification(newVersion: string): void {
-		if (APP_NAME === "quail") {
+		if (currentApp.suppressUpstreamVersionCheck) {
 			return;
 		}
 
@@ -4916,6 +4814,11 @@ export class InteractiveMode {
 	}
 
 	private async handleProcessCommand(): Promise<void> {
+		const processingThread = currentApp.processingThread;
+		if (!processingThread) {
+			this.showWarning("This app does not provide a processing thread.");
+			return;
+		}
 		if (this.session.isStreaming) {
 			this.showWarning("Wait for the current response to finish before opening the processing thread.");
 			return;
@@ -4931,7 +4834,8 @@ export class InteractiveMode {
 			return;
 		}
 
-		const prompt = buildQuailProcessingSystemPrompt(this.sessionManager.getCwd());
+		const cwd = this.sessionManager.getCwd();
+		const prompt = processingThread.buildSystemPrompt(cwd);
 		const args = [
 			cliPath,
 			"--no-session",
@@ -4956,16 +4860,10 @@ export class InteractiveMode {
 		this.ui.stop();
 		this.ui.terminal.clearScreen();
 		try {
-			const processEnv = {
-				...process.env,
-				QUAIL_PROCESS_THREAD: "1",
-				PI_SKIP_VERSION_CHECK: "1",
-				PATH: `${this.sessionManager.getCwd()}${path.delimiter}${process.env.PATH ?? ""}`,
-			};
 			const result = spawnSync(process.execPath, args, {
-				cwd: this.sessionManager.getCwd(),
+				cwd,
 				stdio: "inherit",
-				env: processEnv,
+				env: processingThread.buildEnvironment(cwd),
 			});
 			if (result.error) {
 				this.showError(`Processing thread failed to launch: ${result.error.message}`);
@@ -5244,11 +5142,9 @@ export class InteractiveMode {
 	}
 
 	private handleChangelogCommand(): void {
-		if (APP_NAME === "quail") {
+		if (currentApp.changelogReplacementMessage) {
 			this.chatContainer.addChild(new Spacer(1));
-			this.chatContainer.addChild(
-				new Text("Quail does not show Pi's upstream changelog. Quail-specific release notes are not bundled yet.", 1, 0),
-			);
+			this.chatContainer.addChild(new Text(currentApp.changelogReplacementMessage, 1, 0));
 			this.ui.requestRender();
 			return;
 		}

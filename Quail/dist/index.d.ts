@@ -1,3 +1,5 @@
+export { currentApp, isCurrentApp } from "./apps/current.js";
+export type { AppDefinition, AppHeaderOptions, AppInteractiveAdapter, AppProcessingThreadAdapter, AppSlashCommand, AppStartupContent, } from "./apps/types.js";
 export { getAgentDir, VERSION } from "./config.js";
 export { AgentSession, type AgentSessionConfig, type AgentSessionEvent, type AgentSessionEventListener, type ModelCycleResult, type ParsedSkillBlock, type PromptOptions, parseSkillBlock, type SessionStats, } from "./core/agent-session.js";
 export { type ApiKeyCredential, type AuthCredential, type AuthStatus, AuthStorage, type AuthStorageBackend, FileAuthStorageBackend, InMemoryAuthStorageBackend, type OAuthCredential, } from "./core/auth-storage.js";

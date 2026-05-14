@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createEmptyAnalysisState } from "../src/quail/analysis-state.js";
-import { inspectDatasetFile, processDataset } from "../src/quail/dataset-store.js";
+import { inspectDatasetFile, loadDatasets, processDataset, scoreEmbeddingVectorValues } from "../src/quail/dataset-store.js";
 import { clearQuailDslRuntimeCaches, executeQuailCallBlocks, getQuailDslRuntimeCacheStats } from "../src/quail/dsl.js";
 import { getQuailDatasetsDir } from "../src/quail/paths.js";
 
@@ -12,9 +12,15 @@ const DATASET_SLUG = "dsl-check";
 
 describe("quail DSL", () => {
 	let cwd: string;
+	let previousWorkspacePath: string | undefined;
+	let previousWorkspaceScope: string | undefined;
 
 	beforeEach(async () => {
+		previousWorkspacePath = process.env.QUAIL_WORKSPACE_PATH;
+		previousWorkspaceScope = process.env.QUAIL_WORKSPACE_SCOPE;
 		cwd = mkdtempSync(join(tmpdir(), "quail-dsl-"));
+		process.env.QUAIL_WORKSPACE_PATH = join(cwd, "workspace");
+		delete process.env.QUAIL_WORKSPACE_SCOPE;
 		const inputPath = join(cwd, "dataset.csv");
 		writeFileSync(
 			inputPath,
@@ -36,6 +42,10 @@ describe("quail DSL", () => {
 	});
 
 	afterEach(() => {
+		if (previousWorkspacePath === undefined) delete process.env.QUAIL_WORKSPACE_PATH;
+		else process.env.QUAIL_WORKSPACE_PATH = previousWorkspacePath;
+		if (previousWorkspaceScope === undefined) delete process.env.QUAIL_WORKSPACE_SCOPE;
+		else process.env.QUAIL_WORKSPACE_SCOPE = previousWorkspaceScope;
 		rmSync(cwd, { recursive: true, force: true });
 	});
 
@@ -107,6 +117,122 @@ describe("quail DSL", () => {
 			"Aircraft",
 			"Aircraft",
 			"0",
+		]);
+	});
+
+	it("adds, removes, filters, and lists tag values without clobbering source fields", async () => {
+		const result = await run([
+			`tag("${DATASET_SLUG}:000001" with "codes" set to ["attention", "communication"])`,
+			`tag("${DATASET_SLUG}:000001" with "codes" add ["attention", "fatigue"])`,
+			`tag("${DATASET_SLUG}:000002" with "codes" set to "fatigue")`,
+			`tag("${DATASET_SLUG}:000002" with "year" set to "manual-tag")`,
+			`print(get("${DATASET_SLUG}:000001").tags["codes"])`,
+			`print(get(tag_fields))`,
+			`print(get(["codes"]))`,
+			`print(get(["year"]))`,
+			`print(count(tags: ["codes": "fatigue"]))`,
+			`untag("${DATASET_SLUG}:000001" with "codes" remove "attention")`,
+			`print(get("${DATASET_SLUG}:000001").tags["codes"])`,
+			`untag("codes" from "${DATASET_SLUG}:000001")`,
+			`print(type(get("${DATASET_SLUG}:000001").tags["codes"]))`,
+			`print(count(tags: ["codes": "communication"]))`,
+		].join("\n"));
+
+		expect(result.errors).toEqual([]);
+		expect(result.output.trim().split("\n")).toEqual([
+			"Tagged 2 entries with 6 tag values across 2 fields: codes, year.",
+			`[`,
+			`  "attention",`,
+			`  "communication",`,
+			`  "fatigue"`,
+			`]`,
+			`[`,
+			`  "codes",`,
+			`  "year"`,
+			`]`,
+			`[`,
+			`  "attention",`,
+			`  "communication",`,
+			`  "fatigue"`,
+			`]`,
+			`[`,
+			`  2024,`,
+			`  2025,`,
+			`  2026,`,
+			`  "manual-tag"`,
+			`]`,
+			"2",
+			"Removed 1 tag value from 1 entry across 1 field: codes.",
+			`[`,
+			`  "communication",`,
+			`  "fatigue"`,
+			`]`,
+			"Removed 1 tag field from 1 entry across 1 field: codes.",
+			"undefined",
+			"0",
+		]);
+	});
+
+	it("persists variables, saved groups, and tags across sequential Quail calls", async () => {
+		const state = createEmptyAnalysisState();
+		const first = await executeQuailCallBlocks({
+			cwd,
+			state,
+			blocks: [{ datasets: [DATASET_NAME], code: [
+				`var apple = group(contains: ["text": "apple"])`,
+				`var running_total = count(apple)`,
+				`tag(apple with "review_code" set to "fruit")`,
+				`print(apple, running_total)`,
+			].join("\n"), raw: "" }],
+		});
+		expect(first.errors).toEqual([]);
+		expect(first.output.trim().split("\n")).toEqual([
+			"Tagged 2 entries with 2 tag values across 1 field: review_code.",
+			"G1 2",
+		]);
+
+		const second = await executeQuailCallBlocks({
+			cwd,
+			state: first.state,
+			blocks: [{ datasets: [DATASET_NAME], code: [
+				`running_total += count(G1)`,
+				`print(get(groups))`,
+				`print(get(G1).id, get(G1).entryIds[0], get(G1).entryIds[1])`,
+				`print(running_total, count(tags: ["review_code": "fruit"]))`,
+			].join("\n"), raw: "" }],
+		});
+
+		expect(second.errors).toEqual([]);
+		expect(second.output.trim().split("\n")).toEqual([
+			`[`,
+			`  "G1"`,
+			`]`,
+			`G1 ${DATASET_SLUG}:000001 ${DATASET_SLUG}:000003`,
+			"4 2",
+		]);
+	});
+
+	it("handles assignment operators, arithmetic, list updates, and conditional membership", async () => {
+		const result = await run([
+			`var n = 10`,
+			`n += 2`,
+			`n -= 5`,
+			`var label = "score-"`,
+			`label += str(n)`,
+			`var ids = [${DATASET_SLUG}:000001, ${DATASET_SLUG}:000002]`,
+			`ids += [${DATASET_SLUG}:000003]`,
+			`ids -= ${DATASET_SLUG}:000002`,
+			`print(label, n * 3, n / 2, +n, -n, len(ids))`,
+			`if ${DATASET_SLUG}:000003 in ids and ${DATASET_SLUG}:000002 not in ids:`,
+			`    print("membership-ok")`,
+			`else:`,
+			`    print("membership-bad")`,
+		].join("\n"));
+
+		expect(result.errors).toEqual([]);
+		expect(result.output.trim().split("\n")).toEqual([
+			"score-7 21 3.5 7 -7 2",
+			"membership-ok",
 		]);
 	});
 
@@ -405,6 +531,68 @@ describe("quail DSL", () => {
 		expect(stats.fieldComparisonHits).toBeGreaterThan(0);
 	});
 
+	it("bulk scores file-backed embedding vectors in entry order", () => {
+		const previousLimit = process.env.QUAIL_EAGER_VECTOR_FILE_BYTES;
+		process.env.QUAIL_EAGER_VECTOR_FILE_BYTES = "1";
+		try {
+			const datasetsDir = getQuailDatasetsDir(cwd);
+			const datasetDir = join(datasetsDir, "binary-embeddings");
+			mkdirSync(datasetDir, { recursive: true });
+			writeFileSync(join(datasetDir, "manifest.json"), JSON.stringify({
+				name: "Binary Embeddings",
+				slug: "binary-embeddings",
+				createdAt: "2026-05-13T00:00:00.000Z",
+				updatedAt: "2026-05-13T00:00:00.000Z",
+				entryCount: 3,
+				metadataFields: ["text"],
+				fieldNames: ["text"],
+				textFields: ["text"],
+				fieldTypes: { text: "string" },
+				embeddedFields: ["text"],
+				embeddingModel: "test-model",
+				embeddingDimensions: 2,
+				batchSize: 64,
+				source: { format: "test" },
+				files: { entries: "entries.jsonl", bm25: "bm25.json", embeddings: "embeddings.json" },
+			}, null, 2), "utf8");
+			writeFileSync(join(datasetDir, "entries.jsonl"), [
+				JSON.stringify({ id: "binary-embeddings:000001", dataset: "Binary Embeddings", ordinal: 1, text: "east", fields: { text: "east" }, tags: {}, contains: "east", fieldContains: { text: "east" } }),
+				JSON.stringify({ id: "binary-embeddings:000002", dataset: "Binary Embeddings", ordinal: 2, text: "north", fields: { text: "north" }, tags: {}, contains: "north", fieldContains: { text: "north" } }),
+				JSON.stringify({ id: "binary-embeddings:000003", dataset: "Binary Embeddings", ordinal: 3, text: "diagonal", fields: { text: "diagonal" }, tags: {}, contains: "diagonal", fieldContains: { text: "diagonal" } }),
+			].join("\n") + "\n", "utf8");
+			writeFileSync(join(datasetDir, "bm25.json"), JSON.stringify({
+				k1: 1.5,
+				b: 0.75,
+				avgDocLength: 1,
+				docCount: 3,
+				docLengths: {},
+				docFreq: {},
+				termFreq: {},
+			}), "utf8");
+			writeFileSync(join(datasetDir, "embeddings.json"), JSON.stringify({
+				format: "float32-binary-v1",
+				model: "test-model",
+				dimensions: 2,
+				count: 3,
+				ids: ["binary-embeddings:000001", "binary-embeddings:000002", "binary-embeddings:000003"],
+				vectorsFile: "embeddings.f32",
+			}), "utf8");
+			const buffer = Buffer.allocUnsafe(3 * 2 * 4);
+			[1, 0, 0, 1, 0.6, 0.8].forEach((value, index) => buffer.writeFloatLE(value, index * 4));
+			writeFileSync(join(datasetDir, "embeddings.f32"), buffer);
+			const dataset = loadDatasets(cwd, ["Binary Embeddings"])[0];
+			const scores = scoreEmbeddingVectorValues([
+				dataset.embeddings.vectors["binary-embeddings:000001"],
+				dataset.embeddings.vectors["binary-embeddings:000002"],
+				dataset.embeddings.vectors["binary-embeddings:000003"],
+			], [1, 0]);
+			expect([...scores].map((score) => Number(score.toFixed(3)))).toEqual([1, 0, 0.6]);
+		} finally {
+			if (previousLimit === undefined) delete process.env.QUAIL_EAGER_VECTOR_FILE_BYTES;
+			else process.env.QUAIL_EAGER_VECTOR_FILE_BYTES = previousLimit;
+		}
+	});
+
 	it("inspects field types and supports field type overrides before processing", async () => {
 		const inputPath = join(cwd, "typed.csv");
 		writeFileSync(
@@ -470,6 +658,76 @@ describe("quail DSL", () => {
 			"1",
 			"2",
 			`${DATASET_SLUG}:000002`,
+		]);
+	});
+
+	it("supports middle and bottom retrieval for ranked and unranked scopes", async () => {
+		const result = await run([
+			`print(retrieve(middle 2 of all)[0], retrieve(middle 2 of all)[1])`,
+			`print(retrieve(bottom 2 of all)[0], retrieve(bottom 2 of all)[1])`,
+			`var ranked_bottom = retrieve(bottom 2 in (BM25: ["text": "apple"]) of all)`,
+			`print(ranked_bottom[0], ranked_bottom[1])`,
+			`var ranked_middle = retrieve(middle 2 in (BM25: ["text": "apple"]) of all)`,
+			`print(len(ranked_middle))`,
+			`if ranked_middle[0] in retrieve(top 4 of all):`,
+			`    print("ranked-middle-in-scope")`,
+		].join("\n"));
+
+		expect(result.errors).toEqual([]);
+		expect(result.output.trim().split("\n")).toEqual([
+			`${DATASET_SLUG}:000002 ${DATASET_SLUG}:000003`,
+			`${DATASET_SLUG}:000003 ${DATASET_SLUG}:000004`,
+			`${DATASET_SLUG}:000004 ${DATASET_SLUG}:000002`,
+			"2",
+			"ranked-middle-in-scope",
+		]);
+	});
+
+	it("runs over multiple datasets while preserving stable dataset-qualified ids", async () => {
+		const inputPath = join(cwd, "second.csv");
+		writeFileSync(
+			inputPath,
+			[
+				"text,year",
+				"Epsilon apple fifth,2027",
+				"Zeta banana sixth,2028",
+			].join("\n"),
+			"utf8",
+		);
+		await processDataset({
+			cwd,
+			inputPath,
+			name: "Second DSL Check",
+			skipEmbeddings: true,
+		});
+
+		const result = await executeQuailCallBlocks({
+			cwd,
+			state: createEmptyAnalysisState(),
+			blocks: [{ datasets: [DATASET_NAME, "Second DSL Check"], code: [
+				`print(count(all))`,
+				`print(count(temp(contains: ["text": "apple"])))`,
+				`var ids = retrieve(top 10 of temp(contains: ["text": "banana"]))`,
+				`print(len(ids), ids[0], ids[1])`,
+				`print(count_by(["year"] of temp(include: [second-dsl-check:000001, ${DATASET_SLUG}:000001])))`,
+			].join("\n"), raw: "" }],
+		});
+
+		expect(result.errors).toEqual([]);
+		expect(result.output.trim().split("\n")).toEqual([
+			"6",
+			"3",
+			`2 ${DATASET_SLUG}:000002 second-dsl-check:000002`,
+			`[`,
+			`  {`,
+			`    "year": 2024,`,
+			`    "count": 1`,
+			`  },`,
+			`  {`,
+			`    "year": 2027,`,
+			`    "count": 1`,
+			`  }`,
+			`]`,
 		]);
 	});
 
@@ -564,6 +822,28 @@ describe("quail DSL", () => {
 				code: "E_SEMICOLON",
 				line: 1,
 			},
+		]);
+	});
+
+	it("reports model-repairable runtime errors for invalid DSL constructs", async () => {
+		const result = await run([
+			`print(get(tags))`,
+			`print(count(temp(unknown_key: "apple")))`,
+			`print(count(temp(include: "${DATASET_SLUG}:000001")))`,
+			`print(get("missing-dataset:000001").text)`,
+			`print(retrieve(top 1 in (contains: "apple") of all))`,
+			`print(1 / 0)`,
+			`print("still-runs")`,
+		].join("\n"));
+
+		expect(result.output.trim()).toBe("still-runs");
+		expect(result.errors).toMatchObject([
+			{ code: "E_GET_TAGS_DISABLED", line: 1 },
+			{ code: "E_GROUP_SPEC_KEY", line: 2 },
+			{ code: "E_GROUP_SPEC_VALUE", line: 3 },
+			{ code: "E_UNKNOWN_ID", line: 4 },
+			{ code: "E_PARSE_FILTER", line: 5 },
+			{ code: "E_DIVIDE_BY_ZERO", line: 6 },
 		]);
 	});
 });

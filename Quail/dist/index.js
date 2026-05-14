@@ -1,4 +1,5 @@
 // Core session management
+export { currentApp, isCurrentApp } from "./apps/current.js";
 // Config paths
 export { getAgentDir, VERSION } from "./config.js";
 export { AgentSession, parseSkillBlock, } from "./core/agent-session.js";

@@ -1,7 +1,6 @@
 /**
  * System prompt construction and project context loading
  */
-import { type ActiveDatasetInfo } from "../quail/prompts.js";
 import { type Skill } from "./skills.js";
 export interface BuildSystemPromptOptions {
     /** Custom system prompt (replaces default). */
@@ -24,7 +23,7 @@ export interface BuildSystemPromptOptions {
     /** Pre-loaded skills. */
     skills?: Skill[];
     /** Quail dataset activation context for the qualitative-analysis prompt. */
-    quailActiveDatasets?: ActiveDatasetInfo[];
+    quailActiveDatasets?: unknown[];
 }
 /** Build the system prompt with tools, guidelines, and context */
 export declare function buildSystemPrompt(options: BuildSystemPromptOptions): string;

@@ -213,7 +213,7 @@ export declare class AgentSession {
     private _createRetryPromiseForAgentEnd;
     private _findLastAssistantInMessages;
     private _processAgentEvent;
-    private _handleQuailAnalysisCalls;
+    private _handleAppAssistantMessage;
     /** Resolve the pending retry promise */
     private _resolveRetry;
     /** Extract text content from a message */

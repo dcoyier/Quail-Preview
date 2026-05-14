@@ -6,13 +6,24 @@ import {
 	type QuailCallBlock,
 	type QuailExecutionResult,
 } from "./dsl.js";
-import type { QuailAnalysisState } from "./analysis-state.js";
+import { createEmptyAnalysisState, type QuailAnalysisState } from "./analysis-state.js";
 
 export interface QuailDslExecutorServerOptions {
 	host?: string;
 	port?: number;
 	maxBodyBytes?: number;
 	log?: (event: string, payload?: Record<string, unknown>) => void;
+}
+
+class ExecutorHttpError extends Error {
+	constructor(
+		readonly status: number,
+		readonly code: string,
+		message: string,
+	) {
+		super(message);
+		this.name = "ExecutorHttpError";
+	}
 }
 
 interface RequestRecord {
@@ -43,17 +54,28 @@ function readBody(req: http.IncomingMessage, maxBodyBytes: number): Promise<stri
 	return new Promise((resolve, reject) => {
 		const chunks: Buffer[] = [];
 		let size = 0;
+		let settled = false;
 		req.on("data", (chunk: Buffer) => {
+			if (settled) return;
 			size += chunk.length;
 			if (size > maxBodyBytes) {
-				reject(new Error(`request body exceeds ${maxBodyBytes} bytes`));
-				req.destroy();
+				settled = true;
+				req.resume();
+				reject(new ExecutorHttpError(413, "E_BODY_TOO_LARGE", `Request body exceeds ${maxBodyBytes} bytes.`));
 				return;
 			}
 			chunks.push(chunk);
 		});
-		req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
-		req.on("error", reject);
+		req.on("end", () => {
+			if (settled) return;
+			settled = true;
+			resolve(Buffer.concat(chunks).toString("utf8"));
+		});
+		req.on("error", (error) => {
+			if (settled) return;
+			settled = true;
+			reject(error);
+		});
 	});
 }
 
@@ -66,6 +88,23 @@ function sendJson(res: http.ServerResponse, status: number, payload: unknown): v
 	res.end(body);
 }
 
+function parseJsonBody(body: string): unknown {
+	try {
+		return JSON.parse(body || "{}") as unknown;
+	} catch (error) {
+		throw new ExecutorHttpError(400, "E_BAD_JSON", error instanceof Error ? error.message : String(error));
+	}
+}
+
+function isQuailCallBlock(value: unknown): value is QuailCallBlock {
+	if (!value || typeof value !== "object") return false;
+	const block = value as { datasets?: unknown; code?: unknown; raw?: unknown };
+	return Array.isArray(block.datasets) &&
+		block.datasets.every((item) => typeof item === "string") &&
+		typeof block.code === "string" &&
+		(block.raw === undefined || typeof block.raw === "string");
+}
+
 function isExecutionPayload(value: unknown): value is { version: 1; cwd: string; state: QuailAnalysisState; blocks: QuailCallBlock[] } {
 	if (!value || typeof value !== "object") return false;
 	const payload = value as { version?: unknown; cwd?: unknown; state?: unknown; blocks?: unknown };
@@ -73,7 +112,17 @@ function isExecutionPayload(value: unknown): value is { version: 1; cwd: string;
 		typeof payload.cwd === "string" &&
 		!!payload.state &&
 		typeof payload.state === "object" &&
-		Array.isArray(payload.blocks);
+		Array.isArray(payload.blocks) &&
+		payload.blocks.every(isQuailCallBlock);
+}
+
+function isPrewarmPayload(value: unknown): value is { version: 1; cwd: string; datasets: string[] } {
+	if (!value || typeof value !== "object") return false;
+	const payload = value as { version?: unknown; cwd?: unknown; datasets?: unknown };
+	return payload.version === 1 &&
+		typeof payload.cwd === "string" &&
+		Array.isArray(payload.datasets) &&
+		payload.datasets.every((item) => typeof item === "string");
 }
 
 export async function startQuailDslExecutorServer(options: QuailDslExecutorServerOptions = {}): Promise<http.Server> {
@@ -82,6 +131,7 @@ export async function startQuailDslExecutorServer(options: QuailDslExecutorServe
 	const maxBodyBytes = options.maxBodyBytes ?? Number(process.env.QUAIL_DSL_EXECUTOR_MAX_BODY_BYTES || 128 * 1024 * 1024);
 	const log = options.log ?? defaultLog;
 
+	const previousExecutorDisable = process.env.QUAIL_DSL_EXECUTOR_DISABLE;
 	process.env.QUAIL_DSL_EXECUTOR_DISABLE = "1";
 
 	let queue: Promise<unknown> = Promise.resolve();
@@ -101,8 +151,10 @@ export async function startQuailDslExecutorServer(options: QuailDslExecutorServe
 
 	const handleExecute = async (req: http.IncomingMessage, res: http.ServerResponse): Promise<void> => {
 		const body = await readBody(req, maxBodyBytes);
-		const payload = JSON.parse(body || "{}") as unknown;
-		if (!isExecutionPayload(payload)) throw new Error("Expected payload { version: 1, cwd, state, blocks }");
+		const payload = parseJsonBody(body);
+		if (!isExecutionPayload(payload)) {
+			throw new ExecutorHttpError(400, "E_BAD_EXECUTE_PAYLOAD", "Expected payload { version: 1, cwd, state, blocks }, where blocks contain datasets and code.");
+		}
 		const requestId = nextRequestId++;
 		const queuedAt = Date.now();
 		const blocks = summarizeBlocks(payload.blocks);
@@ -160,8 +212,50 @@ export async function startQuailDslExecutorServer(options: QuailDslExecutorServe
 		sendJson(res, 200, { ok: true, result });
 	};
 
+	const handlePrewarm = async (req: http.IncomingMessage, res: http.ServerResponse): Promise<void> => {
+		const body = await readBody(req, maxBodyBytes);
+		const payload = parseJsonBody(body);
+		if (!isPrewarmPayload(payload)) {
+			throw new ExecutorHttpError(400, "E_BAD_PREWARM_PAYLOAD", "Expected payload { version: 1, cwd, datasets }.");
+		}
+		const startedAt = Date.now();
+		const result = await executeQuailCallBlocks({
+			cwd: payload.cwd,
+			state: createEmptyAnalysisState(),
+			blocks: [{ datasets: payload.datasets, code: "", raw: "" }],
+		});
+		const completedAt = Date.now();
+		log("prewarm_completed", {
+			datasets: payload.datasets,
+			runMs: completedAt - startedAt,
+			errors: result.errors.length,
+			cache: getQuailDslRuntimeCacheStats(),
+		});
+		sendJson(res, 200, { ok: true, errors: result.errors, cache: getQuailDslRuntimeCacheStats() });
+	};
+
+	const handleError = (res: http.ServerResponse, error: unknown): void => {
+		if (res.headersSent) {
+			res.end();
+			return;
+		}
+		if (error instanceof ExecutorHttpError) {
+			sendJson(res, error.status, { ok: false, code: error.code, error: error.message });
+			return;
+		}
+		sendJson(res, 500, {
+			ok: false,
+			code: "E_EXECUTOR_INTERNAL",
+			error: error instanceof Error ? error.message : String(error),
+		});
+	};
+
 	const server = http.createServer((req, res) => {
 		(async () => {
+			if (!req.url) {
+				sendJson(res, 400, { ok: false, code: "E_BAD_REQUEST", error: "Missing request URL." });
+				return;
+			}
 			if (req.method === "GET" && req.url === "/health") {
 				sendJson(res, 200, { ok: true, cache: getQuailDslRuntimeCacheStats() });
 				return;
@@ -179,10 +273,25 @@ export async function startQuailDslExecutorServer(options: QuailDslExecutorServe
 				await handleExecute(req, res);
 				return;
 			}
-			sendJson(res, 404, { ok: false, error: "not found" });
+			if (req.method === "POST" && req.url === "/quail/prewarm") {
+				await handlePrewarm(req, res);
+				return;
+			}
+			const postOnly = new Set(["/cache/clear", "/quail/execute", "/quail/prewarm"]);
+			const getOnly = new Set(["/health", "/status"]);
+			if (postOnly.has(req.url) || getOnly.has(req.url)) {
+				sendJson(res, 405, { ok: false, code: "E_METHOD_NOT_ALLOWED", error: `Method ${req.method} is not allowed for ${req.url}.` });
+				return;
+			}
+			sendJson(res, 404, { ok: false, code: "E_NOT_FOUND", error: "Not found." });
 		})().catch((error) => {
-			sendJson(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) });
+			handleError(res, error);
 		});
+	});
+
+	server.on("close", () => {
+		if (previousExecutorDisable === undefined) delete process.env.QUAIL_DSL_EXECUTOR_DISABLE;
+		else process.env.QUAIL_DSL_EXECUTOR_DISABLE = previousExecutorDisable;
 	});
 
 	await new Promise<void>((resolve, reject) => {

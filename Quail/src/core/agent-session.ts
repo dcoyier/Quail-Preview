@@ -25,9 +25,9 @@ import type {
 } from "@mariozechner/pi-agent-core";
 import type { AssistantMessage, ImageContent, Message, Model, TextContent } from "@mariozechner/pi-ai";
 import { isContextOverflow, modelsAreEqual, resetApiProviders, supportsXhigh } from "@mariozechner/pi-ai";
-import { APP_NAME, getDocsPath } from "../config.js";
+import { currentApp } from "../apps/current.js";
+import { getDocsPath } from "../config.js";
 import { theme } from "../modes/interactive/theme/theme.js";
-import { createQuailAnalysisResultMessage, getActiveDatasetsForPrompt, runQuailAnalysisCalls } from "../quail/index.js";
 import { stripFrontmatter } from "../utils/frontmatter.js";
 import { sleep } from "../utils/sleep.js";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.js";
@@ -580,22 +580,22 @@ export class AgentSession {
 			}
 
 			this._resolveRetry();
-			if (APP_NAME === "quail" && msg.stopReason !== "aborted" && msg.stopReason !== "error") {
-				const didRunQuailCall = await this._handleQuailAnalysisCalls(msg);
-				if (didRunQuailCall) return;
+			if (msg.stopReason !== "aborted" && msg.stopReason !== "error") {
+				const didRunAppFollowUp = await this._handleAppAssistantMessage(msg);
+				if (didRunAppFollowUp) return;
 			}
 			await this._checkCompaction(msg);
 		}
 	}
 
-	private async _handleQuailAnalysisCalls(assistantMessage: AssistantMessage): Promise<boolean> {
-		const result = await runQuailAnalysisCalls({
+	private async _handleAppAssistantMessage(assistantMessage: AssistantMessage): Promise<boolean> {
+		const messages = await currentApp.afterAssistantMessage?.({
 			cwd: this._cwd,
 			sessionManager: this.sessionManager,
 			assistantMessage,
 		});
-		if (!result) return false;
-		await this.agent.prompt([createQuailAnalysisResultMessage(result.message)]);
+		if (!messages || messages.length === 0) return false;
+		await this.agent.prompt(messages);
 		return true;
 	}
 
@@ -932,6 +932,11 @@ export class AgentSession {
 		const loadedSkills = this._resourceLoader.getSkills().skills;
 		const loadedContextFiles = this._resourceLoader.getAgentsFiles().agentsFiles;
 
+		const appSystemPromptContext = currentApp.getSystemPromptContext?.({
+			cwd: this._cwd,
+			messages: this.agent.state.messages,
+		});
+
 		this._baseSystemPromptOptions = {
 			cwd: this._cwd,
 			skills: loadedSkills,
@@ -941,8 +946,7 @@ export class AgentSession {
 			selectedTools: validToolNames,
 			toolSnippets,
 			promptGuidelines,
-			quailActiveDatasets:
-				APP_NAME === "quail" ? getActiveDatasetsForPrompt(this._cwd, this.agent.state.messages) : undefined,
+			...appSystemPromptContext,
 		};
 		return buildSystemPrompt(this._baseSystemPromptOptions);
 	}
@@ -1072,10 +1076,9 @@ export class AgentSession {
 			}
 			this._pendingNextTurnMessages = [];
 
-			// Quail dataset activation is expressed in user text as @"Dataset".
-			// Rebuild the base prompt against the branch plus the pending user turn
-			// before extensions and the provider see this request.
-			if (APP_NAME === "quail") {
+			// Some product adapters derive prompt context from the pending user turn.
+			// Rebuild before extensions and the provider see this request.
+			if (currentApp.shouldRebuildSystemPromptForUserMessage) {
 				const previousMessages = this.agent.state.messages;
 				this.agent.state.messages = [...previousMessages, ...messages];
 				try {
