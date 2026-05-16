@@ -116,6 +116,21 @@ function countLines(text: string): number {
 	return text.length === 0 ? 0 : text.split("\n").length;
 }
 
+function outputMaxCharsFromEnv(): number | undefined {
+	const raw = process.env.QUAIL_TOOL_RESULT_MAX_CHARS;
+	if (raw === undefined || raw.trim() === "") return undefined;
+	const value = Number.parseInt(raw, 10);
+	return Number.isFinite(value) && value > 0 ? Math.max(1_000, value) : undefined;
+}
+
+function truncateToolOutputForModel(output: string): string {
+	const maxChars = outputMaxCharsFromEnv();
+	if (maxChars === undefined || output.length <= maxChars) return output;
+	const suffix = `\n\n[Quail tool output truncated to ${maxChars.toLocaleString()} characters from ${output.length.toLocaleString()}; refine the query or retrieve fewer entries.]\n${QUAIL_RESULT_CONTINUATION_HINT}`;
+	const prefixLength = Math.max(0, maxChars - suffix.length);
+	return `${output.slice(0, prefixLength).trimEnd()}${suffix}`;
+}
+
 export function createQuailQueryToolDefinition(
 	cwd: string,
 	sessionManager: SessionManager,
@@ -161,7 +176,7 @@ export function createQuailQueryToolDefinition(
 				const result = await executeQuailCallBlocks({ cwd, state, blocks: [block] });
 				const executionTimeMs = Math.round(performance.now() - startedAt);
 				sessionManager.appendCustomEntry(QUAIL_ANALYSIS_STATE_ENTRY, result.state);
-				const output = formatQuailExecutionResult(result);
+				const output = truncateToolOutputForModel(formatQuailExecutionResult(result));
 
 			return {
 				content: [{ type: "text", text: output }],
