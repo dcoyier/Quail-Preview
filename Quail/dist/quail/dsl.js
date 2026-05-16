@@ -386,7 +386,7 @@ export async function executeQuailCallBlocks(options) {
                 datasetByEntryId,
                 entryIndexById,
                 entryOrdinalById,
-                sourceFields: Array.from(new Set(entries.flatMap((entry) => Object.keys(entry.fields)))).sort(),
+                processedFields: Array.from(new Set(entries.flatMap((entry) => Object.keys(entry.fields)))).sort(),
                 state,
                 outputs,
                 errors,
@@ -469,6 +469,54 @@ function logicalLines(code) {
     if (buffer)
         out.push({ line: startLine, text: buffer });
     return out;
+}
+function validateBalancedDelimiters(code) {
+    const pairs = { "(": ")", "[": "]", "{": "}" };
+    const closers = new Set(Object.values(pairs));
+    const stack = [];
+    let quoted;
+    let line = 1;
+    for (let i = 0; i < code.length; i++) {
+        const ch = code[i];
+        if (ch === "\n") {
+            line++;
+            continue;
+        }
+        if (quoted) {
+            if (ch === quoted && !isEscaped(code, i))
+                quoted = undefined;
+            continue;
+        }
+        if (ch === "#") {
+            while (i < code.length && code[i] !== "\n")
+                i++;
+            if (i < code.length)
+                line++;
+            continue;
+        }
+        if (ch === "\"" || ch === "'") {
+            quoted = ch;
+            continue;
+        }
+        if (pairs[ch]) {
+            stack.push({ char: ch, line });
+            continue;
+        }
+        if (!closers.has(ch))
+            continue;
+        const opener = stack.pop();
+        if (!opener || pairs[opener.char] !== ch) {
+            const expected = opener ? pairs[opener.char] : "an opening delimiter";
+            throw new DslRuntimeError("E_UNBALANCED_DELIMITER", `Unexpected "${ch}" on line ${line}; expected ${expected}. Check parentheses/brackets in the DSL call.`, line);
+        }
+    }
+    const opener = stack.at(-1);
+    if (opener) {
+        throw new DslRuntimeError("E_UNBALANCED_DELIMITER", `Unclosed "${opener.char}" opened on line ${opener.line}; expected "${pairs[opener.char]}". Check whether a surrounding print(...), retrieve(...), or group expression is missing a final closing delimiter.`, opener.line);
+    }
+    if (quoted) {
+        throw new DslRuntimeError("E_UNBALANCED_DELIMITER", `Unclosed string literal; expected closing ${quoted}.`, line);
+    }
 }
 function delimiterBalanceDelta(text) {
     let depth = 0;
@@ -708,6 +756,11 @@ function transformQuailStatement(text, knownGroupNames, ctx) {
     const assignment = text.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$/s);
     if (assignment) {
         const [, name, rhs] = assignment;
+        const gSaveArg = parseGSaveCallExpression(rhs);
+        if (gSaveArg !== undefined) {
+            knownGroupNames.add(name);
+            return `${name} = __quail_g_save_as(${JSON.stringify(name)}, ${JSON.stringify(gSaveArg)}, locals())`;
+        }
         const groupExpressionText = assignableGroupExpressionText(rhs, { knownGroupNames, ctx });
         if (groupExpressionText) {
             knownGroupNames.add(name);
@@ -718,6 +771,11 @@ function transformQuailStatement(text, knownGroupNames, ctx) {
         else
             knownGroupNames.delete(name);
     }
+    const subtractAssignment = text.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*-=\s*(.+)$/s);
+    if (subtractAssignment) {
+        const [, name, rhs] = subtractAssignment;
+        return quoteBareEntryIds(transformQuailGroupLiterals(transformSpecialPythonCalls(`${name} = __quail_subtract(${name}, ${rhs})`)), ctx);
+    }
     for (const name of ["tag", "untag", "create_field"]) {
         if (!text.startsWith(`${name}(`) || !text.endsWith(")"))
             continue;
@@ -727,7 +785,7 @@ function transformQuailStatement(text, knownGroupNames, ctx) {
             return `__quail_${name}(${JSON.stringify(inner)}, locals())`;
         }
     }
-    return transformQuailGroupLiterals(transformSpecialPythonCalls(text));
+    return quoteBareEntryIds(transformQuailGroupLiterals(transformSpecialPythonCalls(text)), ctx);
 }
 function getKnownGroupVariableNames(ctx) {
     const names = new Set();
@@ -758,6 +816,8 @@ function assignableGroupExpressionText(expr, options = {}) {
         return text;
     if (isDirectGroupReferenceLiteralText(text, options))
         return text;
+    if (/^temp\s*\(/i.test(text))
+        return text;
     if (isComposedGroupExpressionText(text, options))
         return text;
     return undefined;
@@ -766,8 +826,21 @@ function assignmentProducesGroupValue(expr, options) {
     const text = normalizeGroupExpressionText(expr);
     return Boolean(assignableGroupExpressionText(text, options)) ||
         isKnownGroupReferenceText(text, options) ||
+        /^temp\s*\(/i.test(text) ||
         /^group_expr\s*\(/i.test(text) ||
         /^g_save\s*\(/i.test(text);
+}
+function parseGSaveCallExpression(expr) {
+    const trimmed = expr.trim();
+    if (!/^g_save\s*\(/i.test(trimmed))
+        return undefined;
+    const openIndex = trimmed.indexOf("(");
+    if (openIndex < 0)
+        return undefined;
+    const closeIndex = findMatchingClose(trimmed, openIndex, "(", ")");
+    if (closeIndex !== trimmed.length - 1)
+        return undefined;
+    return trimmed.slice(openIndex + 1, closeIndex).trim();
 }
 function isComposedGroupExpressionText(text, options) {
     const normalized = normalizeGroupExpressionText(text);
@@ -823,7 +896,7 @@ function hasDirectGroupExpressionAnchor(text, options) {
         return true;
     if (isKnownGroupReferenceText(normalized, options))
         return true;
-    if (/^(temp|group|group_expr|g_save)\s*\(/i.test(normalized))
+    if (/^(temp|group|group_expr)\s*\(/i.test(normalized))
         return true;
     if (looksLikeGroupSpec(normalized))
         return true;
@@ -925,10 +998,73 @@ function transformSpecialPythonCalls(text) {
             continue;
         }
         const rawArg = text.slice(openIndex + 1, closeIndex).trim();
-        out += `${callNames[name]}(${JSON.stringify(rawArg)}, locals())`;
-        i = closeIndex + 1;
+        const accessor = name === "get" ? parseGetFieldAccessor(text, closeIndex + 1) : undefined;
+        out += `${callNames[name]}(${JSON.stringify(rawArg)}, locals())${accessor ? `[${JSON.stringify(accessor.field)}]` : ""}`;
+        i = accessor?.end ?? closeIndex + 1;
     }
     return out;
+}
+function parseGetFieldAccessor(text, start) {
+    let index = start;
+    while (index < text.length && /\s/.test(text[index]))
+        index++;
+    if (text[index] !== "[")
+        return undefined;
+    const closeIndex = findMatchingClose(text, index, "[", "]");
+    if (closeIndex < 0)
+        return undefined;
+    const inner = text.slice(index + 1, closeIndex).trim();
+    if (!inner || isStringLiteral(inner) || /^-?\d+$/u.test(inner) || inner.includes(":"))
+        return undefined;
+    if (/[()[\]{},+\-*/%<>=!]/u.test(inner))
+        return undefined;
+    return { field: inner, end: closeIndex + 1 };
+}
+function quoteBareEntryIds(text, ctx) {
+    let out = "";
+    let i = 0;
+    while (i < text.length) {
+        const ch = text[i];
+        if (ch === '"' || ch === "'") {
+            const end = scanStringLiteralEnd(text, i);
+            out += text.slice(i, end);
+            i = end;
+            continue;
+        }
+        if (ch === "#") {
+            out += text.slice(i);
+            break;
+        }
+        if (isBareEntryIdTokenChar(ch)) {
+            const start = i;
+            while (i < text.length && isBareEntryIdTokenChar(text[i]))
+                i++;
+            const token = text.slice(start, i);
+            out += token.includes(":") && ctx.entriesById.has(token) ? JSON.stringify(token) : token;
+            continue;
+        }
+        out += ch;
+        i++;
+    }
+    return out;
+}
+function scanStringLiteralEnd(text, start) {
+    const quote = text[start];
+    let index = start + 1;
+    while (index < text.length) {
+        const ch = text[index];
+        if (ch === "\\" && index + 1 < text.length) {
+            index += 2;
+            continue;
+        }
+        index++;
+        if (ch === quote)
+            break;
+    }
+    return index;
+}
+function isBareEntryIdTokenChar(ch) {
+    return Boolean(ch && /[A-Za-z0-9_:-]/u.test(ch));
 }
 function transformQuailGroupLiterals(text) {
     let out = "";
@@ -1030,10 +1166,26 @@ def __quail_retrieve(arg, local_values):
 def __quail_g_save(arg, local_values):
     return _request("g_save", arg, local_values)
 
+def __quail_g_save_as(name, arg, local_values):
+    return _request("g_save", {"name": name, "expr": arg}, local_values)
+
 def __quail_group_expr(arg, local_values=None):
     return {"__quailType": "group_expression", "expression": arg}
 
 class _QuailObject(dict):
+    def __getitem__(self, key):
+        try:
+            return dict.__getitem__(self, key)
+        except KeyError:
+            if isinstance(key, str):
+                tags = dict.get(self, "tags")
+                if isinstance(tags, dict) and key in tags:
+                    return tags[key]
+                fields = dict.get(self, "fields")
+                if isinstance(fields, dict) and key in fields:
+                    return fields[key]
+            raise
+
     def __getattr__(self, key):
         try:
             return self[key]
@@ -1064,6 +1216,33 @@ def __quail_untag(arg, local_values):
 
 def __quail_create_field(arg, local_values):
     return _request("create_field", arg, local_values)
+
+def __quail_subtract(left, right):
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        return left - right
+    if isinstance(left, list):
+        return [item for item in left if item != right]
+    raise TypeError("-= supports numbers and removing one value from a list")
+
+def _quail_type(value):
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int) and not isinstance(value, bool):
+        return "int"
+    if isinstance(value, float):
+        return "float"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "list"
+    if isinstance(value, dict):
+        return "object"
+    return builtins.type(value).__name__
+
+def type(value):
+    return _quail_type(value)
 
 def print(*args, sep=" ", end="\\n"):
     text = sep.join(_format_print_value(arg) for arg in args) + end
@@ -1098,7 +1277,7 @@ def dir(obj=None):
 def _classify_source_binding(value):
     if value is _missing:
         return "missing"
-    if isinstance(value, type):
+    if isinstance(value, builtins.type):
         return "class"
     if callable(value) and hasattr(value, "__code__"):
         return "function"
@@ -1111,9 +1290,10 @@ _missing = object()
 
 _reserved_names = set([
     "_jsonable", "_jsonable_locals", "_request", "_format_print_value",
-    "__quail_count", "__quail_retrieve", "__quail_g_save", "__quail_group_expr", "__quail_get", "__quail_save",
+    "__quail_count", "__quail_retrieve", "__quail_g_save", "__quail_g_save_as", "__quail_group_expr", "__quail_get", "__quail_save",
     "__quail_count_by", "_QuailObject", "_wrap_quail_value", "__quail_tag",
-    "__quail_untag", "__quail_create_field", "print", "json", "sys", "builtins",
+    "__quail_untag", "__quail_create_field", "__quail_subtract", "_quail_type", "type",
+    "print", "json", "sys", "builtins",
     "traceback", "REQUEST_PREFIX", "DONE_PREFIX", "ERROR_PREFIX",
     "_blocked_import", "_blocked_input", "_classify_source_binding", "_python_builtins",
     "_missing", "_reserved_names", "_initial_variables", "_source_binding_names",
@@ -1184,7 +1364,8 @@ async function executePythonProgram(code, ctx) {
         }
         const requestPayload = payload;
         const op = String(requestPayload.op ?? "");
-        const arg = String(requestPayload.arg ?? "");
+        const rawArg = requestPayload.arg;
+        const arg = String(rawArg ?? "");
         if (requestPayload.locals && typeof requestPayload.locals === "object") {
             for (const [key, value] of Object.entries(requestPayload.locals)) {
                 ctx.variables[key] = value;
@@ -1197,8 +1378,10 @@ async function executePythonProgram(code, ctx) {
                 value = await countUnits(arg, ctx, 1);
             else if (op === "retrieve")
                 value = await retrieveUnits(arg, ctx, 1);
-            else if (op === "g_save")
-                value = await gSaveGroup(arg, ctx, 1);
+            else if (op === "g_save") {
+                const request = parseGSaveRequest(rawArg, 1);
+                value = await gSaveGroup(request.name, request.expr, ctx, 1);
+            }
             else if (op === "get")
                 value = await getValue(arg, ctx, 1);
             else if (op === "save")
@@ -1305,6 +1488,7 @@ async function executePythonProgram(code, ctx) {
     }
 }
 async function executeProgram(code, ctx) {
+    validateBalancedDelimiters(code);
     if (shouldUsePythonRuntime(code, ctx)) {
         await executePythonProgram(code, ctx);
         return;
@@ -1341,14 +1525,14 @@ async function executeNode(node, ctx) {
         }
         const varMatch = text.match(/^var\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+)$/);
         if (varMatch) {
-            ctx.variables[varMatch[1]] = await evaluateAssignmentExpression(varMatch[2], ctx, node.line);
+            ctx.variables[varMatch[1]] = await evaluateAssignmentExpression(varMatch[2], ctx, node.line, varMatch[1]);
             clearGroupExpressionCache(ctx);
             return;
         }
         const assignMatch = text.match(/^([a-zA-Z_][a-zA-Z0-9_]*)\s*(\+=|-=|=)\s*(.+)$/);
         if (assignMatch) {
             const current = ctx.variables[assignMatch[1]];
-            const value = await evaluateAssignmentExpression(assignMatch[3], ctx, node.line);
+            const value = await evaluateAssignmentExpression(assignMatch[3], ctx, node.line, assignMatch[2] === "=" ? assignMatch[1] : undefined);
             if (assignMatch[2] === "=")
                 ctx.variables[assignMatch[1]] = value;
             else if (assignMatch[2] === "+=")
@@ -1379,7 +1563,13 @@ async function executeNode(node, ctx) {
             ctx.errors.push({ code: "E_RUNTIME", message: error instanceof Error ? error.message : String(error), line: node.line });
     }
 }
-async function evaluateAssignmentExpression(expr, ctx, line) {
+async function evaluateAssignmentExpression(expr, ctx, line, targetName) {
+    const gSaveArg = parseGSaveCallExpression(expr);
+    if (gSaveArg !== undefined) {
+        if (!targetName)
+            throw gSaveAssignmentError(line);
+        return gSaveGroup(targetName, gSaveArg, ctx, line);
+    }
     const groupExpressionText = assignableGroupExpressionText(expr, { ctx });
     if (groupExpressionText)
         return createGroupExpression(groupExpressionText);
@@ -1687,14 +1877,18 @@ async function evaluateExpression(expr, ctx, line) {
     if (trimmed.startsWith("-") && trimmed.length > 1 && !/^-?\d+(\.\d+)?$/.test(trimmed)) {
         return -toNumber(await evaluateExpression(trimmed.slice(1), ctx, line), "-", line);
     }
-    if (trimmed === "true")
+    if (trimmed === "true" || trimmed === "True")
         return true;
-    if (trimmed === "false")
+    if (trimmed === "false" || trimmed === "False")
         return false;
-    if (trimmed === "null")
+    if (trimmed === "null" || trimmed === "None")
         return null;
     if (/^-?\d+(\.\d+)?$/.test(trimmed))
         return Number(trimmed);
+    if (parseGSaveCallExpression(trimmed) !== undefined)
+        throw gSaveAssignmentError(line);
+    if (/^(?:entries|fields)\s*\[[^\]]+\]/i.test(trimmed))
+        throw parseExpressionError(expr, line);
     const index = splitIndex(trimmed);
     if (index) {
         const base = await evaluateExpression(index.base, ctx, line);
@@ -1721,8 +1915,6 @@ async function evaluateExpression(expr, ctx, line) {
         return lengthExpression(innerCall(trimmed), ctx, line);
     if (trimmed.startsWith("type(") && trimmed.endsWith(")"))
         return typeExpression(innerCall(trimmed), ctx, line);
-    if (trimmed.startsWith("g_save(") && trimmed.endsWith(")"))
-        return gSaveGroup(innerCall(trimmed), ctx, line);
     if (trimmed.startsWith("save(") && trimmed.endsWith(")"))
         return saveVariable(innerCall(trimmed), ctx, line);
     if (trimmed.startsWith("retrieve(") && trimmed.endsWith(")"))
@@ -1745,7 +1937,22 @@ async function evaluateExpression(expr, ctx, line) {
         return ctx.variables[trimmed];
     if (/^[A-Za-z][A-Za-z0-9_:-]*$/.test(trimmed))
         return trimmed;
-    throw new DslRuntimeError("E_PARSE_EXPR", `Could not parse expression: ${expr}`, line);
+    throw parseExpressionError(expr, line);
+}
+function parseExpressionError(expr, line) {
+    const trimmed = trimOuterParens(expr.trim());
+    const listMatch = trimmed.match(/^list\s*\((.*)\)$/is);
+    if (listMatch) {
+        return new DslRuntimeError("E_PARSE_EXPR", `Could not parse expression: ${expr}. list(...) is not a Quail helper. retrieve(...) and get([...]) already return lists; to inspect fields use get(fields) or retrieve(top N fields of G1).`, line);
+    }
+    if (/\b(?:entries|fields)\s*\[[^\]]+\]/i.test(trimmed)) {
+        return new DslRuntimeError("E_PARSE_EXPR", `Could not parse expression: ${expr}. entries[FIELD] and fields[FIELD] are Quail units, so use them inside count(UNIT of GROUP-EXPR) or retrieve(DIRECTION AMOUNT UNIT of GROUP-EXPR), not as standalone Python values.`, line);
+    }
+    const callMatch = trimmed.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*\(/);
+    if (callMatch) {
+        return new DslRuntimeError("E_PARSE_EXPR", `Unknown expression function ${callMatch[1]}(...). Available Quail calls include print, get, retrieve, count, count_by, save, group, group_expr, temp, and g_save when assigned to a variable.`, line);
+    }
+    return new DslRuntimeError("E_PARSE_EXPR", `Could not parse expression: ${expr}. Check parentheses/brackets and use print(...), get(...), retrieve(...), count(...), or a Python literal/variable.`, line);
 }
 async function stringifyExpression(expr, ctx, line) {
     const args = splitTopLevel(expr, ",").filter((part) => part.length > 0);
@@ -2005,7 +2212,21 @@ function getIndex(base, key, line) {
         return chars[normalizeIndex(key, chars.length)];
     }
     if (base && typeof base === "object" && (typeof key === "string" || typeof key === "number")) {
-        return base[String(key)];
+        const record = base;
+        const stringKey = String(key);
+        if (Object.prototype.hasOwnProperty.call(record, stringKey))
+            return record[stringKey];
+        if (typeof key === "string") {
+            const tags = record.tags;
+            if (tags && typeof tags === "object" && Object.prototype.hasOwnProperty.call(tags, key)) {
+                return tags[key];
+            }
+            const fields = record.fields;
+            if (fields && typeof fields === "object" && Object.prototype.hasOwnProperty.call(fields, key)) {
+                return fields[key];
+            }
+        }
+        return undefined;
     }
     throw new DslRuntimeError("E_INDEX", `Cannot index ${formatValueForError(base)} with ${formatValue(key)}`, line);
 }
@@ -2072,6 +2293,9 @@ async function evaluateTagValueExpression(value, ctx, line) {
         trimmed === "true" ||
         trimmed === "false" ||
         trimmed === "null" ||
+        trimmed === "True" ||
+        trimmed === "False" ||
+        trimmed === "None" ||
         /^-?\d+(\.\d+)?$/.test(trimmed)) {
         return evaluateExpression(trimmed, ctx, line);
     }
@@ -2112,7 +2336,7 @@ async function getValue(arg, ctx, line) {
     if (trimmed === "groups")
         return Object.keys(ctx.state.groups);
     if (trimmed === "fields")
-        return getSourceFields(ctx);
+        return getAvailableFields(ctx);
     if (trimmed === "text_fields")
         return getTextFields(ctx);
     if (trimmed === "tag_fields")
@@ -2133,12 +2357,13 @@ async function getValue(arg, ctx, line) {
     if (group)
         return group;
     const entry = ctx.entriesById.get(id);
-    if (!entry)
-        throw new DslRuntimeError("E_UNKNOWN_ID", `Unknown entry or group id ${id}`, line);
+    if (!entry) {
+        throw new DslRuntimeError("E_UNKNOWN_ID", `Unknown entry or group id ${id}. get(...) accepts an entry ID returned by retrieve(... entries of ...), a saved group variable, a list of entry IDs, or a list of field names. Values returned by entries[FIELD] are field/tag values, not entry IDs; retrieve entries of the same group and inspect get(entry)[FIELD] instead.`, line);
+    }
     return formatEntryForGet(entry, ctx);
 }
-function getSourceFields(ctx) {
-    return ctx.sourceFields;
+function getAvailableFields(ctx) {
+    return getAllFieldNames(ctx);
 }
 function getTextFields(ctx) {
     return Array.from(new Set(ctx.datasets.flatMap((dataset) => dataset.manifest.embeddedFields ?? dataset.manifest.textFields ?? []))).sort();
@@ -2183,7 +2408,7 @@ function formatEntryForGet(entry, ctx) {
 function materializeEntryFields(entry, ctx) {
     const fields = { ...entry.fields };
     const dataset = ctx.datasetByEntryId.get(entry.id);
-    for (const field of ctx.sourceFields) {
+    for (const field of ctx.processedFields) {
         if (!Object.prototype.hasOwnProperty.call(fields, field))
             fields[field] = defaultMissingSourceFieldValue(field, dataset);
     }
@@ -2200,13 +2425,7 @@ function defaultMissingSourceFieldValue(field, dataset) {
 function getValuesForFieldOrTag(field, ctx) {
     const values = new Map();
     for (const entry of ctx.entries) {
-        const hasSourceField = Object.prototype.hasOwnProperty.call(entry.fields, field);
-        if (hasSourceField) {
-            const value = entry.fields[field];
-            values.set(stableValueKey(value), value);
-        }
-        const tagSource = hasSourceField ? ctx.state.tagsByEntry[entry.id] : getEntryTags(entry, ctx);
-        for (const item of tagValueToList(tagSource?.[field])) {
+        for (const item of tagValueToList(getEntryTags(entry, ctx)[field])) {
             if (fieldValueToText(item).trim().length > 0) {
                 const normalized = normalizeFieldValue(item);
                 values.set(stableValueKey(normalized), normalized);
@@ -2247,7 +2466,11 @@ function getTagsDictionary(ctx) {
     return Object.fromEntries(Object.entries(tags).map(([field, values]) => [field, [...values].sort()]));
 }
 function getEntryTags(entry, ctx) {
-    return { ...entry.tags, ...(ctx.state.tagsByEntry[entry.id] ?? {}) };
+    return {
+        ...entry.fields,
+        ...entry.tags,
+        ...(ctx.state.tagsByEntry[entry.id] ?? {}),
+    };
 }
 function getTagIndex(ctx) {
     if (ctx.tagIndex)
@@ -2358,6 +2581,12 @@ async function resolveScopedGroupExpressionUncached(text, ctx, line) {
     }
     if (isListLiteralExpression(text))
         return inferScopedMembers(await parseList(text, ctx, line), ctx, text, line);
+    const saved = ctx.state.groups[text];
+    if (saved) {
+        const scope = saved.scope ?? "entries";
+        const members = saved.members ?? saved.entryIds ?? saved.fieldNames ?? [];
+        return scopedMembers(scope, members, text);
+    }
     if (text in ctx.variables) {
         const value = ctx.variables[text];
         if (isGroupExpressionValue(value))
@@ -2369,7 +2598,7 @@ async function resolveScopedGroupExpressionUncached(text, ctx, line) {
         throw new DslRuntimeError("E_GROUP_EXPR_VARIABLE", `Variable ${text} does not contain a group expression.`, line);
     }
     if (text.startsWith("g_save(") && text.endsWith(")")) {
-        return resolveScopedGroupExpression(await gSaveGroup(innerCall(text), ctx, line), ctx, line);
+        throw gSaveAssignmentError(line);
     }
     if (text.startsWith("group(") && text.endsWith(")")) {
         return resolveScopedGroupExpression(await createGroup(innerCall(text), ctx, line), ctx, line);
@@ -2380,12 +2609,6 @@ async function resolveScopedGroupExpressionUncached(text, ctx, line) {
     if (text.startsWith("temp(") && text.endsWith(")")) {
         const ids = await resolveGroupSpec(innerCall(text), ctx, line);
         return scopedMembers("entries", [...ids], text);
-    }
-    const saved = ctx.state.groups[text];
-    if (saved) {
-        const scope = saved.scope ?? "entries";
-        const members = saved.members ?? saved.entryIds ?? saved.fieldNames ?? [];
-        return scopedMembers(scope, members, text);
     }
     if (text.startsWith("scope:"))
         return resolveScopedGroup(text, ctx, line);
@@ -2411,7 +2634,14 @@ async function resolveScopedGroupExpressionUncached(text, ctx, line) {
         return scopedMembers("entries", [text], text);
     if (getAllFieldNames(ctx).includes(text))
         return scopedMembers("fields", [text], text);
-    throw new DslRuntimeError("E_GROUP_EXPR", `Unknown group expression: ${text}. Use G0, G1, a saved group id, a list, or a scoped group expression.`, line);
+    throw unknownScopedGroupExpressionError(text, line);
+}
+function unknownScopedGroupExpressionError(text, line) {
+    const trimmed = trimOuterParens(text.trim());
+    if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(trimmed)) {
+        return new DslRuntimeError("E_GROUP_EXPR", `No group variable named ${trimmed} exists. If ${trimmed} was assigned from g_save(...), check earlier errors: failed g_save assignments do not create groups. Define it with ${trimmed} = g_save((scope: G0, ...)) or use G0, G1, a saved group variable, a list, or a scoped group expression.`, line);
+    }
+    return new DslRuntimeError("E_GROUP_EXPR", `Unknown group expression: ${text}. Use G0, G1, a saved group variable, a list, or a scoped group expression like (scope: G0, ([field] BM25 similarity to "query" > 0)).`, line);
 }
 function combineScopedMembers(parts, op, ctx, line, spec) {
     const [first] = parts;
@@ -2640,13 +2870,31 @@ async function evaluateClauseValue(scope, member, expression, ctx, line) {
         return texts.length === 1 ? texts[0] : texts;
     return evaluateFunctionText(input.functionText, texts, { entryId: scope === "entries" ? member : undefined, field: input.field }, ctx, line);
 }
-async function gSaveGroup(arg, ctx, line) {
+function gSaveAssignmentError(line) {
+    return new DslRuntimeError("E_G_SAVE_ASSIGNMENT", "g_save(GROUP-EXPR) must be assigned to a variable, e.g. saved_group = g_save((scope: G0, ([field] BM25 similarity to \"query\" > 0))).", line);
+}
+function parseGSaveRequest(rawArg, line) {
+    if (!rawArg || typeof rawArg !== "object" || Array.isArray(rawArg))
+        throw gSaveAssignmentError(line);
+    const record = rawArg;
+    if (typeof record.name !== "string" || typeof record.expr !== "string")
+        throw gSaveAssignmentError(line);
+    return { name: record.name, expr: record.expr };
+}
+function validateSavedGroupVariableName(name, line) {
+    const trimmed = name.trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(trimmed)) {
+        throw new DslRuntimeError("E_G_SAVE_NAME", `g_save() variable names must be Python-style identifiers, got ${name}`, line);
+    }
+    if (trimmed === "G0" || trimmed === "G1" || /^G\d+$/.test(trimmed)) {
+        throw new DslRuntimeError("E_G_SAVE_NAME", `${trimmed} is reserved for built-in/legacy group IDs; assign g_save(...) to a descriptive variable name instead.`, line);
+    }
+    return trimmed;
+}
+async function gSaveGroup(name, arg, ctx, line) {
+    const groupId = validateSavedGroupVariableName(name, line);
     arg = resolveCommandTextArgument(arg, ctx, line);
     const group = await resolveScopedGroupExpression(arg, ctx, line);
-    while (ctx.state.nextGroupNumber < 2 || ctx.state.groups[`G${ctx.state.nextGroupNumber}`]) {
-        ctx.state.nextGroupNumber++;
-    }
-    const groupId = `G${ctx.state.nextGroupNumber++}`;
     ctx.state.groups[groupId] = {
         id: groupId,
         datasets: ctx.activeDatasetNames,
@@ -2657,7 +2905,8 @@ async function gSaveGroup(arg, ctx, line) {
         fieldNames: group.scope === "fields" ? group.members : undefined,
         createdAt: new Date().toISOString(),
     };
-    pushOutput(ctx, groupId);
+    ctx.variables[groupId] = groupId;
+    ctx.state.variables[groupId] = groupId;
     clearGroupExpressionCache(ctx);
     return groupId;
 }
@@ -2732,7 +2981,12 @@ async function parseUnitSpec(text, ctx, line) {
         throw new DslRuntimeError("E_PARSE_UNIT", `Expected unit entries, entries[FIELD], fields, or fields[FIELD] before of GROUP-EXPR, got ${text}`, line);
     const base = match[1].toLowerCase();
     const field = match[2] !== undefined ? await evaluateFieldName(match[2], ctx, line) : undefined;
-    const regexOps = await parseRegexOps(match[3].trim(), ctx, line);
+    const regexText = match[3].trim();
+    const dotField = regexText.match(/^\.([A-Za-z_][A-Za-z0-9_]*)\s*\./);
+    if (!field && dotField) {
+        throw new DslRuntimeError("E_PARSE_UNIT", `Use ${base}[${dotField[1]}]${regexText.slice(dotField[1].length + 1)} instead of ${base}.${dotField[1]}${regexText.slice(dotField[1].length + 1)}. Field-specific units use bracket syntax.`, line);
+    }
+    const regexOps = await parseRegexOps(regexText, ctx, line);
     if (base === "entries") {
         return { scope: "entries", kind: field ? "entryField" : "entries", field, regexOps, raw: trimmed };
     }
@@ -2740,9 +2994,6 @@ async function parseUnitSpec(text, ctx, line) {
 }
 function buildUnitValues(unit, group, ctx, line) {
     if (unit.scope !== group.scope) {
-        if (unit.kind === "fieldValues" && group.scope === "entries" && unit.field && sourceFieldExists(unit.field, ctx)) {
-            return buildSourceFieldValuesForEntries(unit, group, ctx, line);
-        }
         throw new DslRuntimeError("E_UNIT_SCOPE", `${unit.raw} cannot be retrieved from a ${group.scope}-scoped GROUP-EXPR`, line);
     }
     const cacheKey = `${unit.raw}\0${group.scope}\0${group.members.join("\0")}`;
@@ -2752,40 +3003,6 @@ function buildUnitValues(unit, group, ctx, line) {
     const values = buildUnitValuesUncached(unit, group, ctx, line);
     ctx.unitValuesCache.set(cacheKey, cloneUnitValues(values));
     return values;
-}
-function buildSourceFieldValuesForEntries(unit, group, ctx, line) {
-    const field = unit.field;
-    if (!field)
-        return [];
-    let sourceIndex = 0;
-    const values = new Map();
-    for (const entryId of group.members) {
-        const entry = ctx.entriesById.get(entryId);
-        if (!entry || !Object.prototype.hasOwnProperty.call(entry.fields, field))
-            continue;
-        const rawValues = Array.isArray(entry.fields[field]) ? entry.fields[field] : [entry.fields[field]];
-        for (const value of rawValues) {
-            const normalized = normalizeFieldValue(value);
-            const key = stableValueKey(normalized);
-            if (values.has(key))
-                continue;
-            values.set(key, {
-                value: normalized,
-                text: fieldValueToText(normalized),
-                fieldName: field,
-                sourceIndex: sourceIndex++,
-            });
-        }
-    }
-    const out = [...values.values()].sort((a, b) => compareFieldValues(a.value, b.value));
-    if (unit.regexOps.length === 0)
-        return out;
-    return out.flatMap((value) => applyRegexOpsToTexts([value.text], unit.regexOps, line).map((textValue) => ({
-        ...value,
-        value: textValue,
-        text: textValue,
-        scoreByEntry: false,
-    })));
 }
 function cloneUnitValues(values) {
     return values.map((value) => ({ ...value }));
@@ -2802,9 +3019,6 @@ function buildUnitValuesUncached(unit, group, ctx, line) {
                 values.push({ value, text: fieldValueToText(value), entryId, fieldName: unit.field, sourceIndex: sourceIndex++ });
             }
         }
-        if (values.length === 0 && unit.field && sourceFieldExists(unit.field, ctx) && !tagFieldExists(unit.field, ctx)) {
-            throw new DslRuntimeError("E_UNIT_SOURCE_FIELD", `entries[${unit.field}] retrieves Quail analysis tags, but ${unit.field} is a source field with no tag values. Retrieve entry ids with entries of GROUP-EXPR, batch inspect source values with rows = get(ids) then row.fields[${JSON.stringify(unit.field)}], use get(id).fields[${JSON.stringify(unit.field)}] for a single entry, or use [${unit.field}] inside a scoped clause or ranking.`, line);
-        }
     }
     else if (unit.kind === "fields") {
         values = group.members.map((fieldName) => ({ value: fieldName, text: fieldName, fieldName, sourceIndex: sourceIndex++ }));
@@ -2818,14 +3032,6 @@ function buildUnitValuesUncached(unit, group, ctx, line) {
             fieldName: unit.field,
             sourceIndex: sourceIndex++,
         }));
-        if (values.length === 0 && sourceFieldExists(unit.field, ctx) && !tagFieldExists(unit.field, ctx)) {
-            values = fieldValuesForField(unit.field, ctx).map((value) => ({
-                value,
-                text: fieldValueToText(value),
-                fieldName: unit.field,
-                sourceIndex: sourceIndex++,
-            }));
-        }
     }
     if (unit.regexOps.length === 0)
         return values;
@@ -2835,14 +3041,6 @@ function buildUnitValuesUncached(unit, group, ctx, line) {
         text: textValue,
         scoreByEntry: false,
     })));
-}
-function sourceFieldExists(field, ctx) {
-    return ctx.entries.some((entry) => Object.prototype.hasOwnProperty.call(entry.fields, field));
-}
-function tagFieldExists(field, ctx) {
-    if (ctx.state.createdFields?.includes(field))
-        return true;
-    return ctx.entries.some((entry) => Object.prototype.hasOwnProperty.call(getEntryTags(entry, ctx), field));
 }
 function fieldValuesForField(field, ctx) {
     return getValuesForFieldOrTag(field, ctx);
@@ -2874,13 +3072,7 @@ function getEntryFunctionValues(entryId, field, ctx) {
         return [];
     if (!field)
         return [entry.text || entry.id];
-    const values = [];
-    if (Object.prototype.hasOwnProperty.call(entry.fields, field))
-        values.push(entry.fields[field]);
-    const tags = getEntryTags(entry, ctx);
-    if (Object.prototype.hasOwnProperty.call(tags, field))
-        values.push(...tagValueToList(tags[field]));
-    return values.flatMap((value) => Array.isArray(value) ? value : [value]);
+    return getEntryTagValues(entryId, field, ctx);
 }
 async function evaluateRankingExpression(expr, unit, ctx, line) {
     const trimmed = trimOuterParens(expr.trim());
@@ -2932,7 +3124,7 @@ async function evaluateFunctionText(functionText, inputTexts, context, ctx, line
     }
     const match = text.match(/^(?:(total|avg)\s+)?(?:per\s+(total|avg)\s+)?(?:(BM25|embed|embeddings?)\s+)?similarity\s+to\s+(.+)$/i);
     if (!match)
-        throw new DslRuntimeError("E_FUNCTION", `Unknown function: ${functionText}`, line);
+        throw functionSyntaxError(functionText, ctx, line);
     const inputAccumulation = match[1]?.toLowerCase() ?? (inputTexts.length > 1 ? "total" : "avg");
     const testAccumulation = match[2]?.toLowerCase() ?? "avg";
     const mode = match[3]?.toLowerCase().startsWith("embed") ? "embed" : "BM25";
@@ -2942,6 +3134,39 @@ async function evaluateFunctionText(functionText, inputTexts, context, ctx, line
         return aggregateNumbers(perTarget, testAccumulation);
     }));
     return aggregateNumbers(scores, inputAccumulation);
+}
+function functionSyntaxError(functionText, ctx, line) {
+    const text = functionText.trim();
+    if (/^\.length\b/i.test(text)) {
+        return new DslRuntimeError("E_FUNCTION", "Use space-based function syntax after regex operations: .find(r\"pattern\") length, not .find(r\"pattern\").length.", line);
+    }
+    const regexWithoutDot = text.match(/^(find|remove|splice)\s*\(/i);
+    if (regexWithoutDot) {
+        return new DslRuntimeError("E_FUNCTION", `Regex operations must start with a dot when applied to the current unit: use .${regexWithoutDot[1].toLowerCase()}(...) length, or use a field-qualified expression such as [content].${regexWithoutDot[1].toLowerCase()}(...) length.`, line);
+    }
+    const bareFieldRegex = text.match(/^([A-Za-z_][A-Za-z0-9_]*)\.(find|remove|splice)\s*\(/i);
+    if (bareFieldRegex) {
+        const name = bareFieldRegex[1];
+        const op = bareFieldRegex[2].toLowerCase();
+        if (name === "entry") {
+            return new DslRuntimeError("E_FUNCTION", `There is no entry pseudo-field. To search document text, use a real field such as [content].${op}(...) length or [text].${op}(...) length. Omitting [FIELD] operates on raw entry IDs for entries, not on document text.`, line);
+        }
+        if (getAllFieldNames(ctx).includes(name)) {
+            return new DslRuntimeError("E_FUNCTION", `Field references require brackets: use [${name}].${op}(...) length, not ${name}.${op}(...) length.`, line);
+        }
+        return new DslRuntimeError("E_FUNCTION", `Unknown field-style expression ${name}.${op}(...). Field references require brackets, for example [content].${op}(...) length.`, line);
+    }
+    const bareSimilarity = text.match(/^([A-Za-z_][A-Za-z0-9_]*)\s+(?:(?:total|avg)\s+)?(?:(?:BM25|embed|embeddings?)\s+)?similarity\s+to\b/i);
+    if (bareSimilarity) {
+        const name = bareSimilarity[1];
+        if (name === "entry") {
+            return new DslRuntimeError("E_FUNCTION", "There is no entry pseudo-field for similarity. To search document text, use a real field such as [content] BM25 similarity to \"query\". Omitting [FIELD] scores raw entry IDs for entries, not document text.", line);
+        }
+        if (getAllFieldNames(ctx).includes(name)) {
+            return new DslRuntimeError("E_FUNCTION", `Field references require brackets: use [${name}] BM25 similarity to "query", not ${name} BM25 similarity to "query".`, line);
+        }
+    }
+    return new DslRuntimeError("E_FUNCTION", `Unknown function: ${functionText}. Expected length or similarity syntax such as BM25 similarity to "query". Regex operations use dot syntax before the function, for example .find(r"pattern") length or [content].find(r"pattern") length.`, line);
 }
 async function evaluateSimilarityTargets(text, ctx, line) {
     const cacheKey = similarityTargetExpressionCacheKey(text, ctx);
@@ -2988,7 +3213,7 @@ function looksLikeSimilarityGroupTarget(text, ctx) {
         return true;
     if (text.startsWith("scope:"))
         return true;
-    if (/^(not\s+|temp\(|group\(|g_save\(|group_expr\()/i.test(text))
+    if (/^(not\s+|temp\(|group\(|group_expr\()/i.test(text))
         return true;
     if (looksLikeGroupSpec(text))
         return true;
@@ -3134,8 +3359,22 @@ async function evaluateFieldName(text, ctx, line) {
 async function parseRegexOps(text, ctx, line) {
     const parsed = await parseRegexOpsPrefix(text, ctx, line);
     if (parsed.rest.trim())
-        throw new DslRuntimeError("E_REGEX", `Could not parse regex chain: ${text}`, line);
+        throw regexSyntaxError(text, parsed.rest.trim(), line);
     return parsed.ops;
+}
+function regexSyntaxError(original, rest, line) {
+    const trimmedRest = rest.trim();
+    if (/^\.length\b/i.test(trimmedRest)) {
+        return new DslRuntimeError("E_REGEX", "Use space-based function syntax after regex operations: entries[field].find(r\"pattern\") of GROUP-EXPR sorted by (length), not entries[field].find(r\"pattern\").length.", line);
+    }
+    const missingDot = trimmedRest.match(/^(find|remove|splice)\s*\(/i);
+    if (missingDot) {
+        return new DslRuntimeError("E_REGEX", `Regex operations on units must start with a dot: use .${missingDot[1].toLowerCase()}(...) after entries[FIELD] or fields[FIELD].`, line);
+    }
+    if (trimmedRest.startsWith(".")) {
+        return new DslRuntimeError("E_REGEX", `Unknown regex operation in ${original}. Valid unit regex operations are .find(...), .remove(...), and .splice(i, j), chained before of GROUP-EXPR.`, line);
+    }
+    return new DslRuntimeError("E_REGEX", `Could not parse regex chain: ${original}. Unit regex operations must look like .find(r"pattern"), .remove(r"pattern"), or .splice(i, j).`, line);
 }
 async function parseRegexOpsPrefix(text, ctx, line) {
     const ops = [];
@@ -3297,14 +3536,11 @@ async function countBy(arg, ctx, line) {
 }
 function expandFieldOrTagValues(fields, entry, ctx) {
     const valuesByField = fields.map((field) => {
-        const hasSourceField = Object.prototype.hasOwnProperty.call(entry.fields, field);
-        const fieldValue = hasSourceField ? [entry.fields[field]] : [];
-        const tagSource = hasSourceField ? ctx.state.tagsByEntry[entry.id] : getEntryTags(entry, ctx);
-        const tagValues = tagValueToList(tagSource?.[field])
+        const values = tagValueToList(getEntryTags(entry, ctx)[field])
             .filter((value) => fieldValueToText(value).trim().length > 0)
             .map(normalizeFieldValue);
-        const values = uniqueFieldValues([...fieldValue, ...tagValues]);
-        return values.length > 0 ? values : ["(missing)"];
+        const unique = uniqueFieldValues(values);
+        return unique.length > 0 ? unique : ["(missing)"];
     });
     let rows = [[]];
     for (const values of valuesByField) {
@@ -3575,6 +3811,13 @@ async function resolveGroupExpression(expr, ctx, line) {
 async function resolveGroupExpressionUncached(text, ctx, line) {
     if (!text || text === "G0")
         return IdBitSet.full(ctx.entries.length);
+    if (ctx.state.groups[text]) {
+        const group = ctx.state.groups[text];
+        if ((group.scope ?? "entries") !== "entries") {
+            throw new DslRuntimeError("E_GROUP_SCOPE", `${text} is field-scoped and cannot be used where entry ids are required`, line);
+        }
+        return IdBitSet.fromIds(group.entryIds ?? group.members ?? [], ctx);
+    }
     if (text in ctx.variables) {
         const value = ctx.variables[text];
         if (isGroupExpressionValue(value))
@@ -3582,13 +3825,6 @@ async function resolveGroupExpressionUncached(text, ctx, line) {
         if (typeof value === "string")
             return resolveGroupExpression(value, ctx, line);
         throw new DslRuntimeError("E_GROUP_EXPR_VARIABLE", `Variable ${text} does not contain a group expression. Use group_expr(<group_expression>) when assigning reusable group expressions.`, line);
-    }
-    if (ctx.state.groups[text]) {
-        const group = ctx.state.groups[text];
-        if ((group.scope ?? "entries") !== "entries") {
-            throw new DslRuntimeError("E_GROUP_SCOPE", `${text} is field-scoped and cannot be used where entry ids are required`, line);
-        }
-        return IdBitSet.fromIds(group.entryIds ?? group.members ?? [], ctx);
     }
     const orParts = splitTopLevelByWord(text, "or");
     if (orParts.length > 1) {
@@ -3623,7 +3859,14 @@ async function resolveGroupExpressionUncached(text, ctx, line) {
     if (looksLikeGroupSpec(text)) {
         return resolveGroupSpecBits(text, ctx, line);
     }
-    throw new DslRuntimeError("E_GROUP_EXPR", `Unknown entry group expression: ${text}. Use G0, a saved entry group id, temp(...), or count(UNIT of GROUP-EXPR) for field-scoped units.`, line);
+    throw unknownEntryGroupExpressionError(text, line);
+}
+function unknownEntryGroupExpressionError(text, line) {
+    const trimmed = trimOuterParens(text.trim());
+    if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(trimmed)) {
+        return new DslRuntimeError("E_GROUP_EXPR", `No entry group variable named ${trimmed} exists. If ${trimmed} was assigned from g_save(...), check earlier errors: failed g_save assignments do not create groups. Use ${trimmed} = g_save((scope: G0, ...)), G0, temp(...), or count(UNIT of GROUP-EXPR) for field-scoped units.`, line);
+    }
+    return new DslRuntimeError("E_GROUP_EXPR", `Unknown entry group expression: ${text}. Use G0, a saved entry group variable, temp(...), or count(UNIT of GROUP-EXPR) for field-scoped units.`, line);
 }
 function looksLikeGroupSpec(text) {
     return /^(BM25|embeddings?|contains|contains_word|containsword|fields_compare|field_compare|include|exclude|tags)\s*:/i.test(text.trim());
@@ -3641,10 +3884,10 @@ function getFieldText(id, field, ctx) {
     if (!field)
         return entry.text;
     const dataset = ctx.datasetByEntryId.get(id);
-    if (dataset?.manifest.fieldTypes?.[field] !== "string")
+    const fieldType = dataset?.manifest.fieldTypes?.[field];
+    if (fieldType && fieldType !== "string")
         return "";
-    const value = entry.fields[field];
-    return typeof value === "string" ? value : "";
+    return getEntryTagValues(id, field, ctx).map((value) => typeof value === "string" ? value : fieldValueToText(value)).join(" ");
 }
 function getFieldContains(id, field, ctx) {
     const entry = ctx.entriesById.get(id);
@@ -3653,8 +3896,11 @@ function getFieldContains(id, field, ctx) {
     if (!field)
         return entry.contains;
     const dataset = ctx.datasetByEntryId.get(id);
-    if (dataset?.manifest.fieldTypes?.[field] !== "string")
+    const fieldType = dataset?.manifest.fieldTypes?.[field];
+    if (fieldType && fieldType !== "string")
         return "";
+    if (Object.prototype.hasOwnProperty.call(ctx.state.tagsByEntry[id] ?? {}, field))
+        return normalizeContainsText(getFieldText(id, field, ctx));
     return entry.fieldContains[field] ?? normalizeContainsText(getFieldText(id, field, ctx));
 }
 function getIdsComparingFields(comparisons, ctx, line) {
@@ -3669,16 +3915,21 @@ function getIdsComparingFields(comparisons, ctx, line) {
         return cached;
     }
     ctx.runtimeCache.stats.fieldComparisonMisses++;
-    const ids = IdBitSet.fromPredicate(ctx, (entry) => comparisons.every((comparison) => fieldComparisonMatches(entry.fields[comparison.field], comparison, line)));
+    const ids = IdBitSet.fromPredicate(ctx, (entry) => comparisons.every((comparison) => fieldComparisonValuesMatch(getEntryTagValues(entry.id, comparison.field, ctx).map(normalizeFieldValue), comparison, line)));
     ctx.runtimeCache.fieldComparisonIdSets.set(key, ids);
     return ids;
 }
 function fieldValueEquals(left, right) {
     return stableValueKey(left) === stableValueKey(right);
 }
-function fieldComparisonMatches(left, comparison, line) {
-    if (left === undefined)
+function fieldComparisonValuesMatch(values, comparison, line) {
+    if (values.length === 0)
         return false;
+    if (comparison.operator === "!=")
+        return values.every((value) => !fieldValueEquals(value, comparison.value));
+    return values.some((value) => fieldComparisonMatches(value, comparison, line));
+}
+function fieldComparisonMatches(left, comparison, line) {
     if (comparison.operator === "==")
         return fieldValueEquals(left, comparison.value);
     if (comparison.operator === "!=")

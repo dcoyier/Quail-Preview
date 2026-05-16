@@ -170,17 +170,18 @@ describe("quail DSL", () => {
 		expect(result.output).toContain(`${DATASET_SLUG}:000003`);
 	});
 
-	it("supports source-field inspection without treating source fields as tag units", async () => {
+	it("supports processed field inspection as tag units", async () => {
 		const result = await run([
 			`ids = retrieve(top 2 entries of G0)`,
-			`print(get(ids[0]).fields["year"], get(ids[0]).fields["text"])`,
+			`print(get(ids[0])[year], get(ids[0])[text])`,
 			`rows = get(ids)`,
 			`print(rows[1].fields["year"], rows[1].fields["text"])`,
 			`print(get(["year"]))`,
 			`print(retrieve(top 1 entries[year] of G0))`,
-			`print("after-source-field-unit-error")`,
+			`print("after-field-unit")`,
 		].join("\n"));
 
+		expect(result.errors).toEqual([]);
 		expect(result.output.trim().split("\n")).toEqual([
 			"2024 Alpha apple first",
 			"2025 Beta banana second",
@@ -189,14 +190,14 @@ describe("quail DSL", () => {
 			`  2025,`,
 			`  2026`,
 			`]`,
-			"after-source-field-unit-error",
+			`[`,
+			`  2024`,
+			`]`,
+			"after-field-unit",
 			]);
-			expect(result.errors).toMatchObject([{ code: "E_UNIT_SOURCE_FIELD", line: 6 }]);
-			expect(result.errors[0]?.message).toContain("get(id).fields");
-		expect(result.errors[0]?.message).toContain("rows = get(ids)");
 	});
 
-	it("materializes missing source fields in get(id).fields", async () => {
+	it("materializes missing processed fields in get(id).fields", async () => {
 		removeFieldFromEntry(2, "text");
 		removeFieldFromEntry(2, "year");
 		const result = await run([
@@ -231,9 +232,8 @@ describe("quail DSL", () => {
 
 		expect(result.errors).toEqual([]);
 		expect(result.output.trim().split("\n")).toEqual([
-			"G2",
 			"Tagged 2 entries with 2 tag values across 1 field: reviewed.",
-			"G2 2",
+			"apples 2",
 			`[`,
 			`  true,`,
 			`  true`,
@@ -286,6 +286,89 @@ describe("quail DSL", () => {
 		]);
 	});
 
+	it("retrieves regex-derived field snippets and reports missing call delimiters clearly", async () => {
+		const ok = await run(`print(retrieve(top 2 entries[text].find(r"(?i).{0,10}apple.{0,10}") of (scope: G0, ([text].find(r"(?i)apple") length > 0))))`);
+
+		expect(ok.errors).toEqual([]);
+		expect(ok.output).toContain("apple");
+
+		const missingPrintClose = await run(`print(retrieve(top 2 entries[text].find(r"(?i).{0,10}apple.{0,10}") of (scope: G0, ([text].find(r"(?i)apple") length > 0)))`);
+
+		expect(missingPrintClose.output).toBe("");
+		expect(missingPrintClose.errors).toMatchObject([{ code: "E_UNBALANCED_DELIMITER", line: 1 }]);
+		expect(missingPrintClose.errors[0]?.message).toContain("Unclosed");
+		expect(missingPrintClose.errors[0]?.message).toContain("print");
+	});
+
+	it("gives a repairable error for dot-style field units", async () => {
+		const result = await run(`print(retrieve(top 1 entries.text.find(r"apple") of G0))`);
+
+		expect(result.output).toBe("");
+		expect(result.errors).toMatchObject([{ code: "E_PARSE_UNIT", line: 1 }]);
+		expect(result.errors[0]?.message).toContain("entries[text].find");
+	});
+
+	it("gives repairable errors for common field and regex function mistakes", async () => {
+		const bareField = await run(`print(count(entries of (scope: G0, (text.find(r"apple") length > 0))))`);
+		expect(bareField.output).toBe("");
+		expect(bareField.errors).toMatchObject([{ code: "E_FUNCTION", line: 1 }]);
+		expect(bareField.errors[0]?.message).toContain("Field references require brackets");
+		expect(bareField.errors[0]?.message).toContain("[text].find");
+
+		const bareSimilarity = await run(`print(retrieve(top 1 entries of G0 sorted by (text BM25 similarity to "apple")))`);
+		expect(bareSimilarity.output).toBe("");
+		expect(bareSimilarity.errors).toMatchObject([{ code: "E_FUNCTION", line: 1 }]);
+		expect(bareSimilarity.errors[0]?.message).toContain("Field references require brackets");
+		expect(bareSimilarity.errors[0]?.message).toContain("[text] BM25 similarity");
+
+		const pseudoEntry = await run(`print(count(entries of (scope: G0, (entry.find(r"apple") length > 0))))`);
+		expect(pseudoEntry.output).toBe("");
+		expect(pseudoEntry.errors).toMatchObject([{ code: "E_FUNCTION", line: 1 }]);
+		expect(pseudoEntry.errors[0]?.message).toContain("There is no entry pseudo-field");
+		expect(pseudoEntry.errors[0]?.message).toContain("Omitting [FIELD] operates on raw entry IDs");
+
+		const missingDot = await run(`print(retrieve(top 1 entries[text] of G0 sorted by (find(r"apple") length)))`);
+		expect(missingDot.output).toBe("");
+		expect(missingDot.errors).toMatchObject([{ code: "E_FUNCTION", line: 1 }]);
+		expect(missingDot.errors[0]?.message).toContain("Regex operations must start with a dot");
+		expect(missingDot.errors[0]?.message).toContain(".find");
+
+		const dotLength = await run(`print(retrieve(top 1 entries[text] of G0 sorted by (.find(r"apple").length)))`);
+		expect(dotLength.output).toBe("");
+		expect(dotLength.errors).toMatchObject([{ code: "E_FUNCTION", line: 1 }]);
+		expect(dotLength.errors[0]?.message).toContain("space-based function syntax");
+		expect(dotLength.errors[0]?.message).toContain("not .find");
+	});
+
+	it("explains missing group variables after failed g_save assignments", async () => {
+		const result = await run([
+			`bad_group = g_save((scope: G0, (text.find(r"apple") length > 0)))`,
+			`print(count(entries of bad_group))`,
+		].join("\n"));
+
+		expect(result.output).toBe("");
+		expect(result.errors).toMatchObject([
+			{ code: "E_FUNCTION", line: 1 },
+			{ code: "E_GROUP_EXPR", line: 2 },
+		]);
+		expect(result.errors[1]?.message).toContain("No group variable named bad_group exists");
+		expect(result.errors[1]?.message).toContain("failed g_save assignments do not create groups");
+	});
+
+	it("explains standalone unit expressions and get() lookups that are not entry ids", async () => {
+		const standaloneUnit = await run(`print(fields[text])`);
+		expect(standaloneUnit.output).toBe("");
+		expect(standaloneUnit.errors).toMatchObject([{ code: "E_PARSE_EXPR", line: 1 }]);
+		expect(standaloneUnit.errors[0]?.message).toContain("fields[FIELD] are Quail units");
+		expect(standaloneUnit.errors[0]?.message).toContain("retrieve(DIRECTION AMOUNT UNIT of GROUP-EXPR)");
+
+		const unknownId = await run(`print(get("not-an-entry-id"))`);
+		expect(unknownId.output).toBe("");
+		expect(unknownId.errors).toMatchObject([{ code: "E_UNKNOWN_ID", line: 1 }]);
+		expect(unknownId.errors[0]?.message).toContain("get(...) accepts an entry ID returned by retrieve");
+		expect(unknownId.errors[0]?.message).toContain("Values returned by entries[FIELD] are field/tag values");
+	});
+
 	it("resolves Python regex pattern bindings inside Quail calls", async () => {
 		const result = await run([
 			`for word in ["alpha", "BETA", "delta", "missing"]:`,
@@ -334,7 +417,7 @@ describe("quail DSL", () => {
 		expect(result.errors[0]?.message).toContain("Scoped inline regex flags");
 	});
 
-	it("treats entries[FIELD] and fields[FIELD] as tag-only units", async () => {
+	it("treats entries[FIELD] and fields[FIELD] as unified field/tag units", async () => {
 		const result = await run([
 			`print(count(entries[year] of G0))`,
 			`print(count(fields[year] of G1))`,
@@ -346,22 +429,71 @@ describe("quail DSL", () => {
 			`print(count(tags: ["year": true]))`,
 		].join("\n"));
 
-		expect(result.errors).toMatchObject([
-			{ code: "E_UNIT_SOURCE_FIELD", line: 1 },
-			{ code: "E_UNIT_SOURCE_FIELD", line: 2 },
-		]);
+		expect(result.errors).toEqual([]);
 		expect(result.output.trim().split("\n")).toEqual([
+			"4",
+			"3",
 			"Tagged 2 entries with 2 tag values across 1 field: year.",
 			`[`,
 			`  2030,`,
-			`  true`,
+			`  2025,`,
+			`  true,`,
+			`  2024`,
 			`]`,
 			`[`,
-			`  2030,`,
-			`  true`,
+			`  2024,`,
+			`  2025,`,
+			`  2026,`,
+			`  2030`,
 			`]`,
 			"1",
 			"1",
+		]);
+	});
+
+	it("supports get(ID)[FIELD] shorthand in direct DSL expressions", async () => {
+		const result = await run([
+			`print(get("${DATASET_SLUG}:000001")[year])`,
+			`print(get("${DATASET_SLUG}:000001")[text])`,
+			`tag("${DATASET_SLUG}:000001" with "year" set to 2030)`,
+			`print(get("${DATASET_SLUG}:000001")[year])`,
+			`print(get("${DATASET_SLUG}:000001").tags["year"])`,
+		].join("\n"));
+
+		expect(result.errors).toEqual([]);
+		expect(result.output.trim().split("\n")).toEqual([
+			"2024",
+			"Alpha apple first",
+			"Tagged 1 entry with 1 tag value across 1 field: year.",
+			"2030",
+			"2030",
+		]);
+	});
+
+	it("keeps processed and added field/tag values unified across discovery, grouping, and units", async () => {
+		const result = await run([
+			`create_field(review)`,
+			`tag("${DATASET_SLUG}:000001" with review set to "checked")`,
+			`tag("${DATASET_SLUG}:000001" with year set to 2030)`,
+			`tag("${DATASET_SLUG}:000002" with year add true)`,
+			`if True:`,
+			`    fields = get(fields)`,
+			`    tag_fields = get(tag_fields)`,
+			`    print("field-check", "text" in fields, "year" in fields, "review" in fields, fields == tag_fields)`,
+			`    print("year-values", get(["year"]))`,
+			`    print("entry2-year", get("${DATASET_SLUG}:000002")[year])`,
+			`    print("counts", count(tags: ["year": 2024]), count(entries of (scope: G0, ([year] == 2024))), count(entries[year] of G0), count(fields[year] of G1))`,
+			`    print("review", count(tags: ["review": "checked"]), count(entries[review] of G0), count(fields[review] of G1))`,
+		].join("\n"));
+
+		expect(result.errors).toEqual([]);
+		expect(result.output.trim().split("\n")).toEqual([
+			"Tagged 2 entries with 3 tag values across 2 fields: review, year.",
+			"field-check true true true true",
+			`year-values [2024,2025,2026,2030,true]`,
+			`entry2-year [2025,true]`,
+			"counts 1 1 5 5",
+			"review 1 1 1",
 		]);
 	});
 
@@ -508,8 +640,71 @@ describe("quail DSL", () => {
 		expect(result.output.trim().split("\n")).toEqual([
 			"2",
 			"1",
-			"G2",
 			"2",
+		]);
+	});
+
+	it("persists g_save variables across calls without emitting automatic G ids", async () => {
+		const state = createEmptyAnalysisState();
+		const first = await executeQuailCallBlocks({
+			cwd,
+			state,
+			blocks: [{ datasets: [DATASET_NAME], code: [
+				`coconut_carp = g_save((scope: G0,`,
+				`    ([text].find(r"[Aa]pple") length > 0)`,
+				`))`,
+				`print(coconut_carp, count(entries of coconut_carp))`,
+			].join("\n"), raw: "" }],
+		});
+
+		expect(first.errors).toEqual([]);
+		expect(Object.keys(first.state.groups)).toEqual(["coconut_carp"]);
+		expect(first.state.variables.coconut_carp).toBe("coconut_carp");
+		expect(first.output.trim()).toBe("coconut_carp 2");
+
+		const second = await executeQuailCallBlocks({
+			cwd,
+			state: first.state,
+			blocks: [{ datasets: [DATASET_NAME], code: [
+				`print(get(coconut_carp).id, count(entries of coconut_carp))`,
+			].join("\n"), raw: "" }],
+		});
+
+		expect(second.errors).toEqual([]);
+		expect(second.output.trim()).toBe("coconut_carp 2");
+	});
+
+	it("saves g_save variables through the Python runtime path", async () => {
+		const result = await run([
+			`for word in ["apple"]:`,
+			`    loop_saved = g_save((scope: G0, ([text] BM25 similarity to word > 0)) )`,
+			`print(loop_saved, count(entries of loop_saved))`,
+			`print(get(loop_saved).id)`,
+		].join("\n"));
+
+		expect(result.errors).toEqual([]);
+		expect(Object.keys(result.state.groups)).toEqual(["loop_saved"]);
+		expect(result.state.variables.loop_saved).toBe("loop_saved");
+		expect(result.output.trim().split("\n")).toEqual([
+			"loop_saved 2",
+			"loop_saved",
+		]);
+	});
+
+	it("rejects unassigned or inline g_save calls", async () => {
+		const bare = await run(`g_save(scope: G0, ([text] BM25 similarity to "apple" > 0))`);
+		expect(bare.errors).toEqual([
+			expect.objectContaining({ code: "E_G_SAVE_ASSIGNMENT" }),
+		]);
+
+		const inline = await run(`print(count(entries of (g_save(scope: G0, ([text] BM25 similarity to "apple" > 0)) and G0)))`);
+		expect(inline.errors).toEqual([
+			expect.objectContaining({ code: "E_G_SAVE_ASSIGNMENT" }),
+		]);
+
+		const reserved = await run(`G2 = g_save(scope: G0, ([text] BM25 similarity to "apple" > 0))`);
+		expect(reserved.errors).toEqual([
+			expect.objectContaining({ code: "E_G_SAVE_NAME" }),
 		]);
 	});
 
@@ -578,9 +773,8 @@ describe("quail DSL", () => {
 
 		expect(result.errors).toEqual([]);
 		expect(result.output.trim().split("\n")).toEqual([
-			"G2",
 			`[`,
-			`  "G2"`,
+			`  "field_group"`,
 			`]`,
 			"fields 2",
 			"2",
@@ -764,12 +958,7 @@ describe("quail DSL", () => {
 
 		expect(result.errors).toEqual([]);
 		expect(result.output.trim().split("\n")).toEqual([
-			`[`,
-			`  {`,
-			`    "year": 2024,`,
-			`    "count": 2`,
-			`  }`,
-			`]`,
+			`[{"year":2024,"count":2}]`,
 			"distribution scoped ok",
 		]);
 	});
@@ -996,11 +1185,11 @@ describe("quail DSL", () => {
 			"2",
 			"Aircraft",
 			"Aircraft",
-			"0",
+			"2",
 		]);
 	});
 
-	it("adds, removes, filters, and lists tag values without clobbering source fields", async () => {
+	it("adds, removes, filters, and lists tag values on unified fields", async () => {
 		const result = await run([
 			`tag("${DATASET_SLUG}:000001" with "codes" set to ["attention", "communication"])`,
 			`tag("${DATASET_SLUG}:000001" with "codes" add ["attention", "fatigue"])`,
@@ -1028,6 +1217,7 @@ describe("quail DSL", () => {
 			`]`,
 			`[`,
 			`  "codes",`,
+			`  "text",`,
 			`  "year"`,
 			`]`,
 			`[`,
@@ -1037,7 +1227,6 @@ describe("quail DSL", () => {
 			`]`,
 			`[`,
 			`  2024,`,
-			`  2025,`,
 			`  2026,`,
 			`  "manual-tag"`,
 			`]`,
@@ -1173,16 +1362,16 @@ describe("quail DSL", () => {
 		].join("\n"));
 
 		expect(result.errors).toEqual([]);
-		expect(result.output.trim().split("\n")).toEqual([
-			"Alpha",
-			"Alpha",
-			"apple first",
-			"first",
-			"17 5 3",
-			`${DATASET_SLUG}:000001 ${DATASET_SLUG}:000002 ${DATASET_SLUG}:000003`,
-			"0",
-		]);
-	});
+			expect(result.output.trim().split("\n")).toEqual([
+				"Alpha",
+				"Alpha",
+				"apple first",
+				"first",
+				"17 5 3",
+				`${DATASET_SLUG}:000001 ${DATASET_SLUG}:000002 ${DATASET_SLUG}:000003`,
+				"2",
+			]);
+		});
 
 	it("retrieves and indexes more than 20 entries when requested", async () => {
 		const inputPath = join(cwd, "large.csv");
@@ -1300,8 +1489,8 @@ describe("quail DSL", () => {
 				`print(count(group_expr(temp(contains_word: ["text": "freedom"]) and G0)))`,
 				`for threshold in [0.0]:`,
 				`    print(count(temp(BM25: ["text": "freedom"] > threshold)))`,
-				`if type(get(["year"])[0]) == "int" and get(["year"])[0] not in []:`,
-				`    print("and ok")`,
+					`if type(get(["year"])[0]) == "string" and get(["year"])[0] not in []:`,
+					`    print("and ok")`,
 				`if count(freedom) > 0 or count(temp(contains_word: ["text": "missing"])) > 0:`,
 				`    print("or ok")`,
 					`for entry in [tag-backed-fields:000001, tag-backed-fields:000002]:`,
@@ -1314,16 +1503,7 @@ describe("quail DSL", () => {
 
 		expect(result.errors).toEqual([]);
 		expect(result.output.trim().split("\n")).toEqual([
-			`[`,
-			`  {`,
-			`    "party": "democrat",`,
-			`    "count": 1`,
-			`  },`,
-			`  {`,
-			`    "party": "republican",`,
-			`    "count": 1`,
-			`  }`,
-			`]`,
+			`[{"party":"democrat","count":1},{"party":"republican","count":1}]`,
 			"1",
 			"1",
 			"distribution ok",
@@ -1340,7 +1520,7 @@ describe("quail DSL", () => {
 		]);
 	});
 
-	it("exposes source fields and typed field values", async () => {
+	it("exposes processed fields and typed field values", async () => {
 		const result = await run([
 			`print(get("${DATASET_SLUG}:000001").fields["text"])`,
 			`print(get("${DATASET_SLUG}:000001").fields["year"])`,
@@ -1574,7 +1754,7 @@ describe("quail DSL", () => {
 		expect(result.output.trim().split("\n")).toEqual(["string", "1"]);
 	});
 
-	it("filters and retrieves using explicit source fields", async () => {
+	it("filters and retrieves using explicit fields", async () => {
 		const result = await run([
 			`print(count(entries of (scope: G0, ([year] == 2024))))`,
 			`print(count(entries of (scope: G0, ([year] == "2024"))))`,

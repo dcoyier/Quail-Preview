@@ -9,7 +9,7 @@ const quailQuerySchema = Type.Object({
         description: "Dataset names to query, usually the activated dataset names shown in the prompt.",
     }),
     code: Type.String({
-        description: "Quail DSL code to execute. Do not include $ wrappers or an @ dataset line; pass datasets separately.",
+        description: "Quail DSL code to execute.",
     }),
 });
 export const DEFAULT_QUAIL_QUERY_OUTPUT_PREVIEW_LINES = 10;
@@ -25,7 +25,9 @@ function formatDatasetList(datasets, theme) {
     const names = datasets.filter((name) => typeof name === "string" && name.trim().length > 0);
     if (names.length === 0)
         return theme.fg("dim", "...");
-    return names.map((name) => theme.fg("accent", `"${name}"`)).join(theme.fg("muted", ", "));
+    return names
+        .map((name) => theme.fg("accent", `"${name}"`))
+        .join(theme.fg("muted", ", "));
 }
 function formatCodePreview(code, theme) {
     if (typeof code !== "string" || code.length === 0)
@@ -45,20 +47,23 @@ function formatQuailQueryCall(args, theme, context) {
     text += `\n${theme.fg("muted", "code:")}\n${formatCodePreview(args?.code, theme)}`;
     return text;
 }
-function formatQuailQueryResult(result, options, theme) {
+function formatQuailQueryResult(result, options, theme, previewLinesOverride) {
     const output = getTextOutput(result, false).trimEnd();
     if (!output)
         return "";
-    let displayOutput = output.startsWith("Output:\n") ? output.slice("Output:\n".length) : output;
+    let displayOutput = output.startsWith("Output:\n")
+        ? output.slice("Output:\n".length)
+        : output;
     displayOutput = displayOutput
         .split("\n")
-        .filter((line) => !/^Call \d+ datasets: /.test(line) && line !== QUAIL_RESULT_CONTINUATION_HINT)
+        .filter((line) => !/^Call \d+ datasets: /.test(line) &&
+        line !== QUAIL_RESULT_CONTINUATION_HINT)
         .join("\n")
         .trimEnd();
     if (!displayOutput)
         return "";
     const lines = displayOutput.split("\n");
-    const previewLines = normalizeOutputPreviewLines(result.details?.outputPreviewLines);
+    const previewLines = normalizeOutputPreviewLines(previewLinesOverride);
     const maxLines = options.expanded ? lines.length : previewLines;
     const displayLines = lines.slice(0, maxLines);
     const remaining = lines.length - maxLines;
@@ -69,15 +74,14 @@ function formatQuailQueryResult(result, options, theme) {
     }
     return text;
 }
-function countLines(text) {
-    return text.length === 0 ? 0 : text.split("\n").length;
-}
 function outputMaxCharsFromEnv() {
     const raw = process.env.QUAIL_TOOL_RESULT_MAX_CHARS;
     if (raw === undefined || raw.trim() === "")
         return undefined;
     const value = Number.parseInt(raw, 10);
-    return Number.isFinite(value) && value > 0 ? Math.max(1_000, value) : undefined;
+    return Number.isFinite(value) && value > 0
+        ? Math.max(1_000, value)
+        : undefined;
 }
 function truncateToolOutputForModel(output) {
     const maxChars = outputMaxCharsFromEnv();
@@ -92,21 +96,16 @@ export function createQuailQueryToolDefinition(cwd, sessionManager, options = {}
     return {
         name: "quail",
         label: "quail",
-        description: "Execute Quail qualitative-analysis DSL against processed datasets. Use this for dataset metadata, grouping, retrieval, counts, distributions, and entry lookup. Pass dataset names in datasets and DSL statements in code; do not write $ blocks as assistant text.",
-        promptSnippet: "Run Quail qualitative-analysis DSL against processed datasets",
-        promptGuidelines: [
-            "For questions about activated Quail datasets, call quail instead of writing DSL blocks as plain text.",
-            "Pass dataset names through the datasets argument and DSL statements through code; do not include $ wrappers or @ dataset lines.",
-            "Use print() for any values that should be returned in the tool result.",
-            "When inspecting source fields for multiple entries, retrieve entry ids first and call get(ids) once; avoid loops that call get(id) per entry.",
-        ],
+        description: "Execute Quail DSL against processed datasets to perform your analysis.",
         parameters: quailQuerySchema,
         executionMode: "sequential",
         async execute(_toolCallId, params, signal) {
             if (signal?.aborted) {
                 throw new Error("Operation aborted");
             }
-            const datasets = params.datasets.map((name) => name.trim()).filter(Boolean);
+            const datasets = params.datasets
+                .map((name) => name.trim())
+                .filter(Boolean);
             if (datasets.length === 0) {
                 throw new Error("quail requires at least one dataset name");
             }
@@ -120,21 +119,16 @@ export function createQuailQueryToolDefinition(cwd, sessionManager, options = {}
                 code,
                 raw: `$\n@${datasets.map((name) => `"${name}"`).join(", ")}\n${code}\n$`,
             };
-            const startedAt = performance.now();
-            const result = await executeQuailCallBlocks({ cwd, state, blocks: [block] });
-            const executionTimeMs = Math.round(performance.now() - startedAt);
+            const result = await executeQuailCallBlocks({
+                cwd,
+                state,
+                blocks: [block],
+            });
             sessionManager.appendCustomEntry(QUAIL_ANALYSIS_STATE_ENTRY, result.state);
             const output = truncateToolOutputForModel(formatQuailExecutionResult(result));
             return {
                 content: [{ type: "text", text: output }],
-                details: {
-                    datasets,
-                    blocks: result.blocks,
-                    hasErrors: result.errors.length > 0,
-                    executionTimeMs,
-                    outputPreviewLines,
-                    outputLineCount: countLines(output),
-                },
+                details: undefined,
             };
         },
         renderCall(args, theme, context) {
@@ -144,7 +138,7 @@ export function createQuailQueryToolDefinition(cwd, sessionManager, options = {}
         },
         renderResult(result, options, theme, context) {
             const text = context.lastComponent ?? new Text("", 0, 0);
-            text.setText(formatQuailQueryResult(result, options, theme));
+            text.setText(formatQuailQueryResult(result, options, theme, outputPreviewLines));
             return text;
         },
     };

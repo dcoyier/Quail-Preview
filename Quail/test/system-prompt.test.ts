@@ -15,10 +15,28 @@ describe("buildSystemPrompt", () => {
 		});
 
 		expect(prompt).toContain("You are an agent in a qualitative research harness.");
+		expect(prompt).toContain("unless directed to.");
 		expect(prompt).toContain("Quail DSL:");
 		expect(prompt).toContain("These are the activated datasets:");
 		expect(prompt).toContain("retrieve(DIRECTION AMOUNT UNIT.REGEX of GROUP-EXPR sorted by RANKING)");
 		expect(prompt).toContain("g_save(GROUP-EXPR)");
+		expect(prompt).toContain("Fundamentally, groups are just sets of either entries or fields; there are two core groups related to this. G0 is the set of all entires and G1 is the set of all fields");
+		expect(prompt).toContain("These are the two possible overall scopes for groups. Groups are just subsets of one of these two.");
+		expect(prompt).toContain("this can be used for relational retrieval *if* processing was sequential, which should not be assumed, but can be tested;");
+		expect(prompt).toContain("Scores are computed from raw BM25 and cosine similarity for embed. Strict BM25 is the default");
+		expect(prompt).toContain("- only what is within print( ... ) will be returned in the results of the quail tool call");
+		expect(prompt).toContain("Usage must be var = g_save(...), where var is the variable where you are saving this group. This variable can then be plugged in as a group across tool executions.");
+		expect(prompt).toContain("g_save(...) cannot be used bare or inline as a GROUP-EXPR and does not print a group ID");
+		expect(prompt).not.toContain("Substituting g_save(GROUP) for a GROUP is the standard usage.");
+		expect(prompt).toContain("Be careful with syntax.");
+		expect(prompt).toContain("And most importantly: The quail tool is complex and incredibly versatile. Do not limit yourself in how you use it.");
+		expect(prompt).not.toContain("This command will print a group ID");
+		expect(prompt).not.toContain("This is the only command that automatically prints something.");
+		expect(prompt).not.toContain("besides:");
+		expect(prompt).not.toContain("group_expr(GROUP-EXPR)");
+		expect(prompt).not.toContain("create an unsaved first-class group expression value");
+		expect(prompt).not.toContain("Final essential notes:");
+		expect(prompt).not.toContain("The quail tool is diverse, do not limit yourself.");
 		expect(prompt).toContain("- (none)");
 		expect(prompt).not.toContain("Available tools:");
 		expect(prompt).not.toContain("Current working directory:");

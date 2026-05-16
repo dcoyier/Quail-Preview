@@ -19,7 +19,7 @@ Options:
   --model <embedding model>             Default: ${defaultEmbeddingModel()}
   --batch-size <n>                      Default: ${defaultEmbeddingBatchSize()}
   --embedding-concurrency <n>           Default: ${defaultEmbeddingConcurrency()}
-  --tag <field=value>                   Can be repeated; added to every entry as a source field
+  --tag <field=value>                   Can be repeated; added to every entry as a field/tag value
   --field-type <field=type>             Override inferred type; type is string, int, float, bool, list, object, mixed, or null
   --dry-run                             Inspect fields without writing a processed dataset
   --overwrite                           Replace an existing dataset of the same name
