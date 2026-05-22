@@ -54,7 +54,7 @@ SCOPE-SETTING
 - description: G0 is the group of all entries. G1 is the group of unique fields. These are the two possible overall scopes for groups. Groups are just subsets of one of these two. Note that groups only filter entries or fields (but they can be filtered by respective tags; see group clauses). What is filtered (not how it is filtered!) is at a higher level compared to ranking; groups are sets of entries or fields, but tags can be ranked and retrieved. Note that G0 and G1 are groups themselves, so can be used as a GROUP / GROUP-EXPR
 
 G-CLAUSE = ([FIELD].REGEX FUNCTION CONDITION (NUM))
-- Note that [FIELD] is not required if seeking to filter based on raw entry IDs or fields. The entry ID is the unit for entries and the set of unique fields are the units for fields
+- Note that [FIELD] is not required if seeking to filter based on raw entry IDs or fields. The entry ID is the unit for entries and the set of unique fields are the units for fields. Brackets around field are always required
 - Note that .REGEX is not required either
 
 FUNCTION

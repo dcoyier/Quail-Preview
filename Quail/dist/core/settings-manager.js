@@ -28,6 +28,28 @@ function deepMergeSettings(base, overrides) {
     }
     return result;
 }
+const LOCK_SLEEP_ARRAY = new Int32Array(new SharedArrayBuffer(4));
+const DEFAULT_SYNC_LOCK_MAX_WAIT_MS = 30_000;
+const DEFAULT_SYNC_LOCK_INITIAL_DELAY_MS = 25;
+const DEFAULT_SYNC_LOCK_MAX_DELAY_MS = 250;
+function getPositiveEnvInt(name, fallback) {
+    const raw = process.env[name];
+    if (!raw)
+        return fallback;
+    const parsed = Number.parseInt(raw, 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+function sleepSync(ms) {
+    if (ms <= 0)
+        return;
+    Atomics.wait(LOCK_SLEEP_ARRAY, 0, 0, ms);
+}
+function isLockError(error) {
+    return (typeof error === "object" &&
+        error !== null &&
+        "code" in error &&
+        String(error.code) === "ELOCKED");
+}
 export class FileSettingsStorage {
     globalSettingsPath;
     projectSettingsPath;
@@ -36,25 +58,27 @@ export class FileSettingsStorage {
         this.projectSettingsPath = join(cwd, CONFIG_DIR_NAME, "settings.json");
     }
     acquireLockSyncWithRetry(path) {
-        const maxAttempts = 10;
-        const delayMs = 20;
+        const maxWaitMs = getPositiveEnvInt("QUAIL_LOCK_MAX_WAIT_MS", DEFAULT_SYNC_LOCK_MAX_WAIT_MS);
+        const initialDelayMs = getPositiveEnvInt("QUAIL_LOCK_INITIAL_DELAY_MS", DEFAULT_SYNC_LOCK_INITIAL_DELAY_MS);
+        const maxDelayMs = getPositiveEnvInt("QUAIL_LOCK_MAX_DELAY_MS", DEFAULT_SYNC_LOCK_MAX_DELAY_MS);
+        const deadline = Date.now() + maxWaitMs;
+        let delayMs = initialDelayMs;
         let lastError;
-        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        while (true) {
             try {
                 return lockfile.lockSync(path, { realpath: false });
             }
             catch (error) {
-                const code = typeof error === "object" && error !== null && "code" in error
-                    ? String(error.code)
-                    : undefined;
-                if (code !== "ELOCKED" || attempt === maxAttempts) {
+                if (!isLockError(error)) {
                     throw error;
                 }
                 lastError = error;
-                const start = Date.now();
-                while (Date.now() - start < delayMs) {
-                    // Sleep synchronously to avoid changing callers to async.
+                const remainingMs = deadline - Date.now();
+                if (remainingMs <= 0) {
+                    throw error;
                 }
+                sleepSync(Math.min(delayMs, maxDelayMs, remainingMs));
+                delayMs = Math.min(maxDelayMs, Math.ceil(delayMs * 1.5));
             }
         }
         throw lastError ?? new Error("Failed to acquire settings lock");

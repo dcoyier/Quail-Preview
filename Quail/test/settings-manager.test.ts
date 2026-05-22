@@ -1,7 +1,8 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import lockfile from "proper-lockfile";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CONFIG_DIR_NAME } from "../src/config.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 
@@ -19,11 +20,12 @@ describe("SettingsManager", () => {
 		mkdirSync(join(projectDir, CONFIG_DIR_NAME), { recursive: true });
 	});
 
-	afterEach(() => {
-		if (existsSync(testDir)) {
-			rmSync(testDir, { recursive: true });
-		}
-	});
+		afterEach(() => {
+			if (existsSync(testDir)) {
+				rmSync(testDir, { recursive: true });
+			}
+			vi.restoreAllMocks();
+		});
 
 	describe("preserves externally added settings", () => {
 		it("should preserve enabledModels when changing thinking level", async () => {
@@ -198,10 +200,34 @@ describe("SettingsManager", () => {
 		});
 	});
 
-	describe("error tracking", () => {
-		it("should collect and clear load errors via drainErrors", () => {
-			const globalSettingsPath = join(agentDir, "settings.json");
-			const projectSettingsPath = join(projectDir, CONFIG_DIR_NAME, "settings.json");
+		describe("error tracking", () => {
+			it("should retry transient settings lock contention during load", () => {
+				const globalSettingsPath = join(agentDir, "settings.json");
+				writeFileSync(globalSettingsPath, JSON.stringify({ theme: "dark" }));
+				const release = vi.fn();
+				const lockError = Object.assign(new Error("locked"), { code: "ELOCKED" });
+				const lockSpy = vi.spyOn(lockfile, "lockSync");
+				lockSpy
+					.mockImplementationOnce(() => {
+						throw lockError;
+					})
+					.mockImplementationOnce(() => {
+						throw lockError;
+					})
+					.mockImplementation(() => release);
+				const waitSpy = vi.spyOn(Atomics, "wait").mockReturnValue("timed-out");
+
+				const manager = SettingsManager.create(projectDir, agentDir);
+
+				expect(manager.getTheme()).toBe("dark");
+				expect(manager.drainErrors()).toEqual([]);
+				expect(lockSpy).toHaveBeenCalledTimes(3);
+				expect(waitSpy).toHaveBeenCalledTimes(2);
+			});
+
+			it("should collect and clear load errors via drainErrors", () => {
+				const globalSettingsPath = join(agentDir, "settings.json");
+				const projectSettingsPath = join(projectDir, CONFIG_DIR_NAME, "settings.json");
 			writeFileSync(globalSettingsPath, "{ invalid global json");
 			writeFileSync(projectSettingsPath, "{ invalid project json");
 

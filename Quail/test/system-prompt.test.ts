@@ -29,7 +29,7 @@ describe("buildSystemPrompt", () => {
 		expect(prompt).toContain("g_save(...) cannot be used bare or inline as a GROUP-EXPR and does not print a group ID");
 		expect(prompt).not.toContain("Substituting g_save(GROUP) for a GROUP is the standard usage.");
 		expect(prompt).toContain("Be careful with syntax.");
-		expect(prompt).toContain("And most importantly: The quail tool is complex and incredibly versatile. Do not limit yourself in how you use it.");
+		expect(prompt).toContain("And most importantly: The quail tool is complex and incredibly versatile. Do not limit yourself in how you use it, and do not arbitrarily stick to repeated search patterns.");
 		expect(prompt).not.toContain("This command will print a group ID");
 		expect(prompt).not.toContain("This is the only command that automatically prints something.");
 		expect(prompt).not.toContain("besides:");

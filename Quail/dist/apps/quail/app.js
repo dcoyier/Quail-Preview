@@ -72,6 +72,8 @@ export const quailApp = {
         });
         if (!result)
             return undefined;
+        if (!result.message.trim())
+            return undefined;
         return [createQuailAnalysisResultMessage(result.message)];
     },
 };

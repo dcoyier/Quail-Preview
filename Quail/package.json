@@ -92,12 +92,15 @@
 		"tui",
 		"agent"
 	],
-	"author": "Mario Zechner",
+	"author": "Dashiell Coyier",
+	"contributors": [
+		"Mario Zechner"
+	],
 	"license": "MIT",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/badlogic/pi-mono.git",
-		"directory": "packages/coding-agent"
+		"url": "git+https://github.com/dcoyier/Quail.git",
+		"directory": "Quail"
 	},
 	"engines": {
 		"node": ">=20.6.0"

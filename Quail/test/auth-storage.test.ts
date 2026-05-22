@@ -371,11 +371,11 @@ describe("AuthStorage", () => {
 			expect(updated.google.key).toBe("google-key");
 		});
 
-		test("remove preserves unrelated external edits", () => {
-			writeAuthJson({
-				anthropic: { type: "api_key", key: "anthropic-key" },
-				openai: { type: "api_key", key: "openai-key" },
-			});
+			test("remove preserves unrelated external edits", () => {
+				writeAuthJson({
+					anthropic: { type: "api_key", key: "anthropic-key" },
+					openai: { type: "api_key", key: "openai-key" },
+				});
 
 			authStorage = AuthStorage.create(authJsonPath);
 
@@ -390,14 +390,75 @@ describe("AuthStorage", () => {
 
 			const updated = JSON.parse(readFileSync(authJsonPath, "utf-8")) as Record<string, { key: string }>;
 			expect(updated.anthropic).toBeUndefined();
-			expect(updated.openai.key).toBe("openai-key");
-			expect(updated.google.key).toBe("google-key");
-		});
-
-		test("does not overwrite malformed auth file after load error", () => {
-			writeAuthJson({
-				anthropic: { type: "api_key", key: "anthropic-key" },
+				expect(updated.openai.key).toBe("openai-key");
+				expect(updated.google.key).toBe("google-key");
 			});
+
+			test("sync load retries transient auth lock contention", async () => {
+				writeAuthJson({
+					anthropic: { type: "api_key", key: "anthropic-key" },
+				});
+				const release = vi.fn();
+				const lockError = Object.assign(new Error("locked"), { code: "ELOCKED" });
+				const lockSpy = vi.spyOn(lockfile, "lockSync");
+				lockSpy
+					.mockImplementationOnce(() => {
+						throw lockError;
+					})
+					.mockImplementationOnce(() => {
+						throw lockError;
+					})
+					.mockImplementation(() => release);
+				const waitSpy = vi.spyOn(Atomics, "wait").mockReturnValue("timed-out");
+
+				authStorage = AuthStorage.create(authJsonPath);
+
+				await expect(authStorage.getApiKey("anthropic")).resolves.toBe("anthropic-key");
+				expect(lockSpy).toHaveBeenCalledTimes(3);
+				expect(waitSpy).toHaveBeenCalledTimes(2);
+				expect(authStorage.drainErrors()).toEqual([]);
+			});
+
+			test("getApiKey retries after an initial auth lock load failure", async () => {
+				writeAuthJson({
+					anthropic: { type: "api_key", key: "anthropic-key" },
+				});
+				const previousMaxWait = process.env.QUAIL_LOCK_MAX_WAIT_MS;
+				const previousInitialDelay = process.env.QUAIL_LOCK_INITIAL_DELAY_MS;
+				const previousMaxDelay = process.env.QUAIL_LOCK_MAX_DELAY_MS;
+				process.env.QUAIL_LOCK_MAX_WAIT_MS = "5";
+				process.env.QUAIL_LOCK_INITIAL_DELAY_MS = "1";
+				process.env.QUAIL_LOCK_MAX_DELAY_MS = "1";
+				const release = vi.fn();
+				const lockError = Object.assign(new Error("locked"), { code: "ELOCKED" });
+				let locked = true;
+				vi.spyOn(lockfile, "lockSync").mockImplementation(() => {
+					if (locked) throw lockError;
+					return release;
+				});
+
+				try {
+					authStorage = AuthStorage.create(authJsonPath);
+					expect(authStorage.drainErrors().some((error) => (error as { code?: string }).code === "ELOCKED")).toBe(true);
+
+					locked = false;
+
+					await expect(authStorage.getApiKey("anthropic")).resolves.toBe("anthropic-key");
+					expect(authStorage.drainErrors()).toEqual([]);
+				} finally {
+					if (previousMaxWait === undefined) delete process.env.QUAIL_LOCK_MAX_WAIT_MS;
+					else process.env.QUAIL_LOCK_MAX_WAIT_MS = previousMaxWait;
+					if (previousInitialDelay === undefined) delete process.env.QUAIL_LOCK_INITIAL_DELAY_MS;
+					else process.env.QUAIL_LOCK_INITIAL_DELAY_MS = previousInitialDelay;
+					if (previousMaxDelay === undefined) delete process.env.QUAIL_LOCK_MAX_DELAY_MS;
+					else process.env.QUAIL_LOCK_MAX_DELAY_MS = previousMaxDelay;
+				}
+			});
+
+			test("does not overwrite malformed auth file after load error", () => {
+				writeAuthJson({
+					anthropic: { type: "api_key", key: "anthropic-key" },
+				});
 
 			authStorage = AuthStorage.create(authJsonPath);
 			writeFileSync(authJsonPath, "{invalid-json", "utf-8");

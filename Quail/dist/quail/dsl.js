@@ -294,10 +294,8 @@ export function formatQuailExecutionResult(result) {
         }
     }
     if (result.output.trim()) {
-        parts.push("Output:");
         parts.push(result.output.trim());
     }
-    parts.push("Use this result to continue. If there were parse/runtime errors, correct the code call before answering.");
     return parts.join("\n");
 }
 function quailDslExecutorUrl() {
@@ -391,7 +389,6 @@ export async function executeQuailCallBlocks(options) {
                 outputs,
                 errors,
                 activeDatasetNames: block.datasets,
-                tagMutations: [],
                 bm25QueryTerms: new Map(),
                 embeddingQueryVectors: new Map(),
                 groupExpressionCache: new Map(),
@@ -402,7 +399,6 @@ export async function executeQuailCallBlocks(options) {
                 variables: cloneJsonableRecord(state.variables),
             };
             await executeProgram(block.code, ctx);
-            flushTagMutationSummary(ctx);
         }
         catch (error) {
             if (error instanceof DslRuntimeError)
@@ -1603,19 +1599,7 @@ function hasUnquotedSemicolon(text) {
     return false;
 }
 function pushOutput(ctx, text) {
-    flushTagMutationSummary(ctx);
     ctx.outputs.push(text);
-}
-function flushTagMutationSummary(ctx) {
-    if (ctx.tagMutations.length === 0)
-        return;
-    const tags = ctx.tagMutations.filter((mutation) => mutation.type === "tag");
-    const untags = ctx.tagMutations.filter((mutation) => mutation.type === "untag");
-    if (tags.length > 0)
-        ctx.outputs.push(formatTagMutationSummary("tag", tags));
-    if (untags.length > 0)
-        ctx.outputs.push(formatTagMutationSummary("untag", untags));
-    ctx.tagMutations = [];
 }
 function clearGroupExpressionCache(ctx) {
     ctx.groupExpressionCache.clear();
@@ -1699,25 +1683,6 @@ function isCacheableGroupExpressionText(text, ctx, seen = new Set()) {
     }
     return !hasSideEffectfulGroupCall(trimmed);
 }
-function formatTagMutationSummary(type, mutations) {
-    const ids = new Set(mutations.map((mutation) => mutation.id));
-    const fields = [...new Set(mutations.map((mutation) => mutation.field))].sort();
-    const valueCount = mutations.reduce((sum, mutation) => sum + mutation.valueCount, 0);
-    const entryWord = ids.size === 1 ? "entry" : "entries";
-    const fieldWord = fields.length === 1 ? "field" : "fields";
-    const fieldList = fields.join(", ");
-    if (type === "tag") {
-        const valueWord = valueCount === 1 ? "tag value" : "tag values";
-        return `Tagged ${ids.size} ${entryWord} with ${valueCount} ${valueWord} across ${fields.length} ${fieldWord}: ${fieldList}.`;
-    }
-    const wholeFieldCount = mutations.filter((mutation) => mutation.wholeField).length;
-    if (wholeFieldCount === mutations.length) {
-        const removedWord = wholeFieldCount === 1 ? "tag field" : "tag fields";
-        return `Removed ${wholeFieldCount} ${removedWord} from ${ids.size} ${entryWord} across ${fields.length} ${fieldWord}: ${fieldList}.`;
-    }
-    const valueWord = valueCount === 1 ? "tag value" : "tag values";
-    return `Removed ${valueCount} ${valueWord} from ${ids.size} ${entryWord} across ${fields.length} ${fieldWord}: ${fieldList}.`;
-}
 function addValues(a, b) {
     if (typeof a === "number" && typeof b === "number")
         return a + b;
@@ -1767,7 +1732,6 @@ async function executeTag(text, ctx, line) {
             entryTags[field] = normalizeStoredTagValue(uniqueValues([...current, ...values]));
         }
         ctx.state.tagsByEntry[id] = entryTags;
-        ctx.tagMutations.push({ type: "tag", id, field, valueCount: values.length });
     }
     if (!ctx.state.createdFields?.includes(field)) {
         ctx.state.createdFields = [...(ctx.state.createdFields ?? []), field];
@@ -1811,7 +1775,6 @@ async function executeUntag(text, ctx, line) {
         ctx.state.tagsByEntry[id] = entryTags;
         ctx.tagIndex = undefined;
         clearGroupExpressionCache(ctx);
-        ctx.tagMutations.push({ type: "untag", id, field, valueCount: values.length });
         return;
     }
     const match = text.match(/^untag\((.+?)\s+from\s+(.+)\)$/);
@@ -1824,7 +1787,6 @@ async function executeUntag(text, ctx, line) {
     for (const id of group.members) {
         if (ctx.state.tagsByEntry[id])
             delete ctx.state.tagsByEntry[id][field];
-        ctx.tagMutations.push({ type: "untag", id, field, valueCount: 1, wholeField: true });
     }
     ctx.tagIndex = undefined;
     clearGroupExpressionCache(ctx);
@@ -2534,7 +2496,7 @@ function allEntryIds(ctx) {
 function getAllFieldNames(ctx) {
     return [
         ...new Set([
-            ...ctx.entries.flatMap((entry) => Object.keys(entry.fields)),
+            ...ctx.processedFields,
             ...getTagFields(ctx),
             ...(ctx.state.createdFields ?? []),
         ]),
@@ -2710,6 +2672,7 @@ async function evaluateGroupClause(scope, text, ctx, line) {
         const parts = splitByTopLevelOperator(text, op);
         if (!parts)
             continue;
+        await validateFunctionExpressionSyntax(parts[0], ctx, line);
         const right = await evaluateLooseValue(parts[2], ctx, line);
         const optimized = await tryOptimizedScopedGroupClause(scope, parts[0], parts[1], right, ctx, line);
         if (optimized)
@@ -2938,6 +2901,8 @@ async function retrieveUnits(arg, ctx, line) {
     const unit = await parseUnitSpec(unitText, ctx, line);
     const group = await resolveScopedGroupExpression(parts[2], ctx, line);
     const values = buildUnitValues(unit, group, ctx, line);
+    if (ranking)
+        await validateRankingExpressionSyntax(ranking, ctx, line);
     const ordered = ranking
         ? (await Promise.all(values.map(async (value) => ({ value, score: await evaluateRankingExpression(ranking, value, ctx, line) }))))
             .sort((a, b) => b.score - a.score)
@@ -3116,6 +3081,29 @@ async function parseFunctionInput(expression, ctx, line) {
     const regexOps = await parseRegexOpsPrefix(rest, ctx, line);
     rest = regexOps.rest.trim();
     return { field, regexOps: regexOps.ops, functionText: rest };
+}
+async function validateFunctionExpressionSyntax(expression, ctx, line) {
+    validateFunctionInputSyntax(await parseFunctionInput(expression, ctx, line), ctx, line);
+}
+function validateFunctionInputSyntax(input, ctx, line) {
+    const text = input.functionText.trim();
+    if (!text || text === "length")
+        return;
+    if (/^(?:(total|avg)\s+)?(?:per\s+(total|avg)\s+)?(?:(BM25|embed|embeddings?)\s+)?similarity\s+to\s+(.+)$/i.test(text))
+        return;
+    throw functionSyntaxError(input.functionText, ctx, line);
+}
+async function validateRankingExpressionSyntax(expr, ctx, line) {
+    const trimmed = trimOuterParens(expr.trim());
+    const arithmetic = splitArithmetic(trimmed, ["+", "-"]) ?? splitArithmetic(trimmed, ["*", "/"]);
+    if (arithmetic) {
+        await validateRankingExpressionSyntax(arithmetic.left, ctx, line);
+        await validateRankingExpressionSyntax(arithmetic.right, ctx, line);
+        return;
+    }
+    if (/^-?\d+(\.\d+)?$/.test(trimmed))
+        return;
+    await validateFunctionExpressionSyntax(trimmed, ctx, line);
 }
 async function evaluateFunctionText(functionText, inputTexts, context, ctx, line) {
     const text = functionText.trim();
@@ -4089,7 +4077,16 @@ async function getBm25GroupScoreVector(target, field, accumulation, ctx) {
             if (!dataset)
                 continue;
             const docId = field ? fieldDocumentId(entry.id, field) : entry.id;
-            scores[index] = bm25ScoreTerms(dataset.bm25, docId, terms) / divisor;
+            if (!field || dataset.bm25.termFreq[docId]) {
+                scores[index] = bm25ScoreTerms(dataset.bm25, docId, terms) / divisor;
+                continue;
+            }
+            const fieldText = getFieldText(entry.id, field, ctx);
+            if (fieldText === entry.text && dataset.bm25.termFreq[entry.id]) {
+                scores[index] = bm25ScoreTerms(dataset.bm25, entry.id, terms) / divisor;
+                continue;
+            }
+            scores[index] = scoreBm25FallbackText(dataset.bm25, fieldText, terms) / divisor;
         }
         return scores;
     });
@@ -4182,7 +4179,11 @@ function scoreBm25(id, predicate, ctx) {
     const docId = predicate.field ? fieldDocumentId(id, predicate.field) : id;
     if (!predicate.field || dataset.bm25.termFreq[docId])
         return bm25ScoreTerms(dataset.bm25, docId, terms);
-    return scoreBm25FallbackText(dataset.bm25, getFieldText(id, predicate.field, ctx), terms);
+    const fieldText = getFieldText(id, predicate.field, ctx);
+    if (fieldText === ctx.entriesById.get(id)?.text && dataset.bm25.termFreq[id]) {
+        return bm25ScoreTerms(dataset.bm25, id, terms);
+    }
+    return scoreBm25FallbackText(dataset.bm25, fieldText, terms);
 }
 function scoreBm25FallbackText(index, text, terms) {
     if (!text || terms.length === 0 || index.docCount === 0)

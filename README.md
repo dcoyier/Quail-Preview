@@ -1,10 +1,12 @@
-# Quail v0.7 Setup
+# Quail Preview Setup
 
-This README only covers Quail-specific setup. For Pi-inherited CLI and model-provider behavior, see the package docs in `Quail/docs/providers.md` and `Quail/docs/models.md`, or the upstream Pi README: https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent.
+This README only covers setup for Quail Preview. For Pi-inherited CLI and model-provider behavior, see the package docs in `Quail/docs/providers.md` and `Quail/docs/models.md`, or the upstream Pi README: https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent.
 
-## Default Quail Embeddings
+Quail Preview is a fork of [Pi](https://github.com/badlogic/pi-mono), originally created by Mario Zechner and licensed under the MIT License. Quail Preview adapts Pi into a terminal-first qualitative analysis tool.
 
-Quail v0.7 is configured to use OpenRouter embeddings by default:
+## Default Quail Preview Embeddings
+
+Quail Preview is configured to use OpenRouter embeddings by default:
 
 - Provider: OpenRouter
 - Model: `qwen/qwen3-embedding-8b`
@@ -24,14 +26,16 @@ cp openrouter.env.example openrouter.env
 ```
 
 Then edit `openrouter.env` and either source it yourself or use the proxy script below, which sources it automatically.
-The bundled `./Quail/hatch` launcher also sources `openrouter.env` from this directory automatically. If you use a PATH-installed `hatch`, launch it from this directory and Quail will load this local `openrouter.env` before embedding.
+The bundled `./Quail/hatch` launcher also sources `openrouter.env` from this directory automatically. If you use a PATH-installed `hatch`, launch it from this directory and Quail Preview will load this local `openrouter.env` before embedding.
 
-From this directory, run Quail through the bundled hatch launcher:
+From this directory, run Quail Preview through the bundled hatch launcher:
 
 ```sh
 ./Quail/hatch dataset list
 ./Quail/hatch dataset process --name "Dataset Name" --input "/absolute/path/to/data.csv"
 ```
+
+`hatch dataset process` is the one-time ingestion step that makes a local corpus available inside Quail Preview. It reads the input file, infers fields and stable entry IDs, stores the processed dataset in the Quail Preview workspace, and builds the retrieval structures used during a thread, including exact/field lookup, BM25 lexical search, and embedding vectors when embeddings are enabled. After a dataset has been processed, start a Quail Preview thread and activate it by name with an `@"Dataset Name"` mention; you normally only reprocess when the source data or embedding configuration changes.
 
 The `--model`, `--batch-size`, and `--embedding-concurrency` flags still override the defaults:
 
@@ -40,17 +44,17 @@ The `--model`, `--batch-size`, and `--embedding-concurrency` flags still overrid
 ```
 
 For persistent local defaults, set `QUAIL_EMBEDDING_BATCH_SIZE` and `QUAIL_EMBEDDING_CONCURRENCY` in `openrouter.env`.
-Quail also retries transient empty, malformed, rate-limited, or server-error embedding responses; tune this with `QUAIL_EMBEDDING_MAX_RETRIES` and `QUAIL_EMBEDDING_RETRY_BASE_MS`.
+Quail Preview also retries transient empty, malformed, rate-limited, or server-error embedding responses; tune this with `QUAIL_EMBEDDING_MAX_RETRIES` and `QUAIL_EMBEDDING_RETRY_BASE_MS`.
 
 ## Optional Ollama-Compatible Proxy
 
-Quail no longer needs Ollama for embeddings. If a workflow expects an Ollama `/api/embed` URL, start the local OpenRouter-backed proxy:
+Quail Preview no longer needs Ollama for embeddings. If a workflow expects an Ollama `/api/embed` URL, start the local OpenRouter-backed proxy:
 
 ```sh
 ./Quail/scripts/start-openrouter-embed-proxy.sh
 ```
 
-In another shell, point Quail's Ollama-compatible embedding backend at the proxy:
+In another shell, point Quail Preview's Ollama-compatible embedding backend at the proxy:
 
 ```sh
 export QUAIL_EMBEDDING_PROVIDER=ollama

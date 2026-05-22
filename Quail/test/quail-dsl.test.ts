@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createEmptyAnalysisState } from "../src/quail/analysis-state.js";
 import { inspectDatasetFile, loadDatasets, processDataset, scoreEmbeddingVectorValues } from "../src/quail/dataset-store.js";
-import { clearQuailDslRuntimeCaches, executeQuailCallBlocks, getQuailDslRuntimeCacheStats } from "../src/quail/dsl.js";
+import { clearQuailDslRuntimeCaches, executeQuailCallBlocks, formatQuailExecutionResult, getQuailDslRuntimeCacheStats } from "../src/quail/dsl.js";
 import { getQuailDatasetsDir } from "../src/quail/paths.js";
 
 const DATASET_NAME = "DSL Check";
@@ -232,7 +232,6 @@ describe("quail DSL", () => {
 
 		expect(result.errors).toEqual([]);
 		expect(result.output.trim().split("\n")).toEqual([
-			"Tagged 2 entries with 2 tag values across 1 field: reviewed.",
 			"apples 2",
 			`[`,
 			`  true,`,
@@ -241,9 +240,38 @@ describe("quail DSL", () => {
 			`[`,
 			`  true`,
 			`]`,
-			"Removed 2 tag fields from 2 entries across 1 field: reviewed.",
 			"0",
 		]);
+	});
+
+	it("does not return tag or untag mutation summaries", async () => {
+		const first = await run(`tag("${DATASET_SLUG}:000001" with silent_review set to "yes")`);
+
+		expect(first.errors).toEqual([]);
+		expect(first.output).toBe("");
+		expect(first.state.tagsByEntry[`${DATASET_SLUG}:000001`]?.silent_review).toBe("yes");
+		expect(formatQuailExecutionResult(first)).toBe("");
+
+		const second = await executeQuailCallBlocks({
+			cwd,
+			state: first.state,
+			blocks: [{
+				datasets: [DATASET_NAME],
+				code: `untag(silent_review from "${DATASET_SLUG}:000001")`,
+				raw: "",
+			}],
+		});
+
+		expect(second.errors).toEqual([]);
+		expect(second.output).toBe("");
+		expect(second.state.tagsByEntry[`${DATASET_SLUG}:000001`]?.silent_review).toBeUndefined();
+	});
+
+	it("formats successful execution results as printed output only", async () => {
+		const result = await run(`print("visible")`);
+
+		expect(result.errors).toEqual([]);
+		expect(formatQuailExecutionResult(result)).toBe("visible");
 	});
 
 	it("supports field-scoped boolean groups, regex remove/splice units, and arithmetic ranking", async () => {
@@ -275,7 +303,6 @@ describe("quail DSL", () => {
 
 		expect(result.errors).toEqual([]);
 		expect(result.output.trim().split("\n")).toEqual([
-			"Tagged 2 entries with 2 tag values across 1 field: snippet.",
 			"[",
 			`  "banana"`,
 			"]",
@@ -401,7 +428,6 @@ describe("quail DSL", () => {
 
 		expect(result.errors).toEqual([]);
 		expect(result.output.trim().split("\n")).toEqual([
-			"Tagged 2 entries with 2 tag values across 1 field: snippet.",
 			"1",
 			"1",
 			"2",
@@ -433,7 +459,6 @@ describe("quail DSL", () => {
 		expect(result.output.trim().split("\n")).toEqual([
 			"4",
 			"3",
-			"Tagged 2 entries with 2 tag values across 1 field: year.",
 			`[`,
 			`  2030,`,
 			`  2025,`,
@@ -464,7 +489,6 @@ describe("quail DSL", () => {
 		expect(result.output.trim().split("\n")).toEqual([
 			"2024",
 			"Alpha apple first",
-			"Tagged 1 entry with 1 tag value across 1 field: year.",
 			"2030",
 			"2030",
 		]);
@@ -488,7 +512,6 @@ describe("quail DSL", () => {
 
 		expect(result.errors).toEqual([]);
 		expect(result.output.trim().split("\n")).toEqual([
-			"Tagged 2 entries with 3 tag values across 2 fields: review, year.",
 			"field-check true true true true",
 			`year-values [2024,2025,2026,2030,true]`,
 			`entry2-year [2025,true]`,
@@ -514,7 +537,6 @@ describe("quail DSL", () => {
 
 		expect(result.errors).toEqual([]);
 		expect(result.output.trim().split("\n")).toEqual([
-			"Tagged 3 entries with 7 tag values across 2 fields: codes, confidence.",
 			"2",
 			"1",
 			"1",
@@ -564,7 +586,6 @@ describe("quail DSL", () => {
 
 		expect(result.errors).toEqual([]);
 		expect(result.output.trim().split("\n")).toEqual([
-			"Tagged 1 entry with 1 tag value across 1 field: coded field.",
 			`[`,
 			`  "alpha"`,
 			`]`,
@@ -799,13 +820,11 @@ describe("quail DSL", () => {
 		expect(result.errors).toEqual([]);
 		expect(result.output.trim().split("\n")).toEqual([
 			"0",
-			"Tagged 2 entries with 2 tag values across 1 field: py_code.",
 			"2",
 			`[`,
 			`  "seen",`,
 			`  "seen"`,
 			`]`,
-			"Removed 2 tag fields from 2 entries across 1 field: py_code.",
 			"0",
 		]);
 	});
@@ -1165,7 +1184,6 @@ describe("quail DSL", () => {
 		expect(result.output.trim().split("\n")).toEqual([
 			"total=4",
 			"[\"alpha\",4]",
-			"Tagged 1 entry with 1 tag value across 1 field: sample_count.",
 			"4",
 		]);
 	});
@@ -1181,7 +1199,6 @@ describe("quail DSL", () => {
 
 		expect(result.errors).toEqual([]);
 		expect(result.output.trim().split("\n")).toEqual([
-			"Tagged 2 entries with 2 tag values across 1 field: assigned_primary_problem_cycle_01.",
 			"2",
 			"Aircraft",
 			"Aircraft",
@@ -1209,7 +1226,6 @@ describe("quail DSL", () => {
 
 		expect(result.errors).toEqual([]);
 		expect(result.output.trim().split("\n")).toEqual([
-			"Tagged 2 entries with 6 tag values across 2 fields: codes, year.",
 			`[`,
 			`  "attention",`,
 			`  "communication",`,
@@ -1231,12 +1247,10 @@ describe("quail DSL", () => {
 			`  "manual-tag"`,
 			`]`,
 			"2",
-			"Removed 1 tag value from 1 entry across 1 field: codes.",
 			`[`,
 			`  "communication",`,
 			`  "fatigue"`,
 			`]`,
-			"Removed 1 tag field from 1 entry across 1 field: codes.",
 			"undefined",
 			"0",
 		]);
@@ -1256,7 +1270,6 @@ describe("quail DSL", () => {
 		});
 		expect(first.errors).toEqual([]);
 		expect(first.output.trim().split("\n")).toEqual([
-			"Tagged 2 entries with 2 tag values across 1 field: review_code.",
 			"G2 2",
 		]);
 

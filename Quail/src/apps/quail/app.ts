@@ -82,6 +82,7 @@ export const quailApp: AppDefinition = {
 			assistantMessage,
 		});
 		if (!result) return undefined;
+		if (!result.message.trim()) return undefined;
 		return [createQuailAnalysisResultMessage(result.message) as AgentMessage];
 	},
 };

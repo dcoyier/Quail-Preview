@@ -44,6 +44,32 @@ type LockResult<T> = {
 	next?: string;
 };
 
+const LOCK_SLEEP_ARRAY = new Int32Array(new SharedArrayBuffer(4));
+const DEFAULT_SYNC_LOCK_MAX_WAIT_MS = 30_000;
+const DEFAULT_SYNC_LOCK_INITIAL_DELAY_MS = 25;
+const DEFAULT_SYNC_LOCK_MAX_DELAY_MS = 250;
+
+function getPositiveEnvInt(name: string, fallback: number): number {
+	const raw = process.env[name];
+	if (!raw) return fallback;
+	const parsed = Number.parseInt(raw, 10);
+	return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function sleepSync(ms: number): void {
+	if (ms <= 0) return;
+	Atomics.wait(LOCK_SLEEP_ARRAY, 0, 0, ms);
+}
+
+function isLockError(error: unknown): boolean {
+	return (
+		typeof error === "object" &&
+		error !== null &&
+		"code" in error &&
+		String((error as { code?: unknown }).code) === "ELOCKED"
+	);
+}
+
 export interface AuthStorageBackend {
 	withLock<T>(fn: (current: string | undefined) => LockResult<T>): T;
 	withLockAsync<T>(fn: (current: string | undefined) => Promise<LockResult<T>>): Promise<T>;
@@ -67,26 +93,27 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 	}
 
 	private acquireLockSyncWithRetry(path: string): () => void {
-		const maxAttempts = 10;
-		const delayMs = 20;
+		const maxWaitMs = getPositiveEnvInt("QUAIL_LOCK_MAX_WAIT_MS", DEFAULT_SYNC_LOCK_MAX_WAIT_MS);
+		const initialDelayMs = getPositiveEnvInt("QUAIL_LOCK_INITIAL_DELAY_MS", DEFAULT_SYNC_LOCK_INITIAL_DELAY_MS);
+		const maxDelayMs = getPositiveEnvInt("QUAIL_LOCK_MAX_DELAY_MS", DEFAULT_SYNC_LOCK_MAX_DELAY_MS);
+		const deadline = Date.now() + maxWaitMs;
+		let delayMs = initialDelayMs;
 		let lastError: unknown;
 
-		for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+		while (true) {
 			try {
 				return lockfile.lockSync(path, { realpath: false });
 			} catch (error) {
-				const code =
-					typeof error === "object" && error !== null && "code" in error
-						? String((error as { code?: unknown }).code)
-						: undefined;
-				if (code !== "ELOCKED" || attempt === maxAttempts) {
+				if (!isLockError(error)) {
 					throw error;
 				}
 				lastError = error;
-				const start = Date.now();
-				while (Date.now() - start < delayMs) {
-					// Sleep synchronously to avoid changing callers to async.
+				const remainingMs = deadline - Date.now();
+				if (remainingMs <= 0) {
+					throw error;
 				}
+				sleepSync(Math.min(delayMs, maxDelayMs, remainingMs));
+				delayMs = Math.min(maxDelayMs, Math.ceil(delayMs * 1.5));
 			}
 		}
 
@@ -453,6 +480,13 @@ export class AuthStorage {
 	 * 5. Fallback resolver (models.json custom providers)
 	 */
 	async getApiKey(providerId: string, options?: { includeFallback?: boolean }): Promise<string | undefined> {
+		if (this.loadError && isLockError(this.loadError)) {
+			this.reload();
+			if (this.loadError && isLockError(this.loadError)) {
+				throw this.loadError;
+			}
+		}
+
 		// Runtime override takes highest priority
 		const runtimeKey = this.runtimeOverrides.get(providerId);
 		if (runtimeKey) {

@@ -6,6 +6,7 @@ declare const quailQuerySchema: Type.TObject<{
     code: Type.TString;
 }>;
 export type QuailQueryToolInput = Static<typeof quailQuerySchema>;
+export type QuailQueryToolDetails = undefined;
 export declare const DEFAULT_QUAIL_QUERY_OUTPUT_PREVIEW_LINES = 10;
 export interface QuailQueryToolOptions {
     /**
@@ -13,14 +14,6 @@ export interface QuailQueryToolOptions {
      * tool row. The model still receives the full tool result.
      */
     outputPreviewLines?: number;
-}
-export interface QuailQueryToolDetails {
-    datasets: string[];
-    blocks: number;
-    hasErrors: boolean;
-    executionTimeMs: number;
-    outputPreviewLines: number;
-    outputLineCount: number;
 }
 export declare function createQuailQueryToolDefinition(cwd: string, sessionManager: SessionManager, options?: QuailQueryToolOptions): ToolDefinition<typeof quailQuerySchema, QuailQueryToolDetails>;
 export {};

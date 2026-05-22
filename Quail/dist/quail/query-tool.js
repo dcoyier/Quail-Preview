@@ -13,7 +13,6 @@ const quailQuerySchema = Type.Object({
     }),
 });
 export const DEFAULT_QUAIL_QUERY_OUTPUT_PREVIEW_LINES = 10;
-const QUAIL_RESULT_CONTINUATION_HINT = "Use this result to continue. If there were parse/runtime errors, correct the code call before answering.";
 function normalizeOutputPreviewLines(value) {
     if (value === undefined || !Number.isFinite(value))
         return DEFAULT_QUAIL_QUERY_OUTPUT_PREVIEW_LINES;
@@ -56,8 +55,7 @@ function formatQuailQueryResult(result, options, theme, previewLinesOverride) {
         : output;
     displayOutput = displayOutput
         .split("\n")
-        .filter((line) => !/^Call \d+ datasets: /.test(line) &&
-        line !== QUAIL_RESULT_CONTINUATION_HINT)
+        .filter((line) => !/^Call \d+ datasets: /.test(line))
         .join("\n")
         .trimEnd();
     if (!displayOutput)
@@ -87,7 +85,7 @@ function truncateToolOutputForModel(output) {
     const maxChars = outputMaxCharsFromEnv();
     if (maxChars === undefined || output.length <= maxChars)
         return output;
-    const suffix = `\n\n[Quail tool output truncated to ${maxChars.toLocaleString()} characters from ${output.length.toLocaleString()}; refine the query or retrieve fewer entries.]\n${QUAIL_RESULT_CONTINUATION_HINT}`;
+    const suffix = `\n\n[Quail tool output truncated to ${maxChars.toLocaleString()} characters from ${output.length.toLocaleString()}; refine the query or retrieve fewer entries.]`;
     const prefixLength = Math.max(0, maxChars - suffix.length);
     return `${output.slice(0, prefixLength).trimEnd()}${suffix}`;
 }
@@ -119,6 +117,7 @@ export function createQuailQueryToolDefinition(cwd, sessionManager, options = {}
                 code,
                 raw: `$\n@${datasets.map((name) => `"${name}"`).join(", ")}\n${code}\n$`,
             };
+            const startedAt = performance.now();
             const result = await executeQuailCallBlocks({
                 cwd,
                 state,
