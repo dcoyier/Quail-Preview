@@ -4,6 +4,8 @@ This README only covers setup for Quail Preview. For Pi-inherited CLI and model-
 
 Quail Preview is a fork of [Pi](https://github.com/badlogic/pi-mono), originally created by Mario Zechner and licensed under the MIT License. Quail Preview adapts Pi into a terminal-first qualitative analysis tool.
 
+Quail Preview modifications and original Quail Preview material are licensed under the Apache License, Version 2.0. Inherited Pi code remains subject to the preserved MIT notice; see [LICENSE](LICENSE), [LICENSE-MIT](LICENSE-MIT), and [NOTICE](NOTICE).
+
 ## Default Quail Preview Embeddings
 
 Quail Preview is configured to use OpenRouter embeddings by default:
@@ -68,3 +70,7 @@ The proxy defaults to OpenRouter plus `qwen/qwen3-embedding-8b`; `openrouter.env
 ## Existing Processed Datasets
 
 BM25, field retrieval, counts, tags, and contains search keep working on existing datasets. Semantic embedding search must use the same embedding family and dimensionality as the processed dataset. If a dataset was processed with `embeddinggemma:latest`, reprocess it to use `qwen/qwen3-embedding-8b` before relying on `embeddings similarity`.
+
+## License
+
+Quail Preview is distributed under `Apache-2.0 AND MIT`: Apache 2.0 for Quail Preview modifications and original Quail Preview material, with Pi's MIT notice preserved for inherited Pi code.
